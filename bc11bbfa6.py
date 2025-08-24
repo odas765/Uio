@@ -564,3 +564,6 @@ async def main():
     async with client:
         print("✅ Bot is running with parallel workers...")
         await client.run_until_disconnected()
+
+if __name__ == '__main__':
+    client.loop.run_until_complete(main())
