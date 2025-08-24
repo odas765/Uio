@@ -3,10 +3,17 @@ import re
 import shutil
 import subprocess
 import json
+import asyncio
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from telethon import TelegramClient, events, Button
 from mutagen import File
+
+
+
+download_lock = asyncio.Lock()
+download_queue = asyncio.Queue()
+state = {}  # user_id -> {"url":..., "type":...}
 
 api_id = '10074048'
 api_hash = 'a08b1ed3365fa3b04bcf2bcbf71aff4d'
@@ -86,6 +93,27 @@ def remove_user(user_id):
     return False
 
 client = TelegramClient(session_name, api_id, api_hash)
+
+async def process_queue():
+    while True:
+        user_id, url, content_type, format_choice = await download_queue.get()
+        try:
+            async with download_lock:
+                await client.send_message(user_id, f"⬇️ Downloading your {content_type}...")
+
+                release_id = url.split('/')[-1]
+                user_folder = f'downloads/{user_id}/{release_id}'
+                os.makedirs(user_folder, exist_ok=True)
+
+                # Run Orpheus download (blocking)
+                subprocess.run(['python', 'orpheus.py', url, '--output', user_folder], check=True)
+
+            await convert_and_send_files(user_id, user_folder, content_type, format_choice)
+
+        except Exception as e:
+            await client.send_message(user_id, f"❌ Error during download/conversion: {e}")
+        finally:
+            download_queue.task_done()
 
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
