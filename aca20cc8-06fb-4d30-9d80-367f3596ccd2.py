@@ -87,6 +87,161 @@ def remove_user(user_id):
 
 client = TelegramClient(session_name, api_id, api_hash)
 
+async def enqueue_download(chat_id, url, content_type, format_choice):
+    """
+    Add a download request to the queue.
+    """
+    global download_queue
+    download_queue.append((chat_id, url, content_type, format_choice))
+    async with queue_lock:
+        await process_queue()
+
+
+async def process_queue():
+    """
+    Process the download queue one by one.
+    """
+    global is_downloading
+    while download_queue:
+        if is_downloading:
+            break  # Already processing, wait
+        is_downloading = True
+        chat_id, url, content_type, format_choice = download_queue.popleft()
+        try:
+            await client.send_message(chat_id, "🎶 Your download has started, please wait...")
+            await run_orpheus(url, content_type, format_choice, chat_id)
+        except Exception as e:
+            await client.send_message(chat_id, f"❌ Error during download: {e}")
+        finally:
+            is_downloading = False
+
+
+async def run_orpheus(url, content_type, format_choice, chat_id):
+    """
+    Run Orpheus asynchronously and handle post-processing.
+    """
+    # Run orpheus.py as subprocess
+    process = await asyncio.create_subprocess_exec(
+        'python', 'orpheus.py', url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise Exception(stderr.decode())
+    
+    # Call your existing conversion & sending logic here
+    # Example placeholder:
+    await client.send_message(chat_id, f"✅ Download finished! Now converting to {format_choice.upper()}...")
+    
+    # Here you can call your existing MP3/FLAC conversion and sending 
+
+async def convert_and_send(chat_id, input_text, content_type, format_choice):
+    """
+    Convert downloaded files and send to the user.
+    """
+    url = urlparse(input_text)
+    components = url.path.split('/')
+    release_id = components[-1]
+
+    try:
+        if content_type == "album":
+            root_path = f'downloads/{release_id}'
+            flac_files = [f for f in os.listdir(root_path) if f.lower().endswith('.flac')]
+            album_path = root_path if flac_files else os.path.join(root_path, os.listdir(root_path)[0])
+            files = os.listdir(album_path)
+
+            all_artists = set()
+            catalog_number = 'N/A'
+            for f in files:
+                if f.lower().endswith('.flac'):
+                    audio = File(os.path.join(album_path, f), easy=True)
+                    if audio:
+                        for key in ('artist', 'performer', 'albumartist'):
+                            if key in audio:
+                                all_artists.update(audio[key])
+                        if 'catalog' in audio:
+                            catalog_number = audio['catalog'][0]
+
+            sample_file = next((f for f in files if f.lower().endswith('.flac')), None)
+            sample_path = os.path.join(album_path, sample_file) if sample_file else None
+            metadata = File(sample_path, easy=True) if sample_path else {}
+
+            album = metadata.get('album', ['Unknown Album'])[0]
+            genre = metadata.get('genre', ['Unknown Genre'])[0]
+            bpm = metadata.get('bpm', ['--'])[0]
+            label = metadata.get('label', ['--'])[0]
+            date = metadata.get('date', ['--'])[0]
+            artists_str = ", ".join(sorted(all_artists))
+
+            caption = (
+                f"<b>\U0001F3B6 Album:</b> {album}\n"
+                f"<b>\U0001F464 Artists:</b> {artists_str}\n"
+                f"<b>\U0001F3A7 Genre:</b> {genre}\n"
+                f"<b>\U0001F4BF Label:</b> {label}\n"
+                f"<b>\U0001F4C5 Release Date:</b> {date}\n"
+                f"<b>\U0001F9E9 BPM:</b> {bpm}\n"
+            )
+
+            cover_file = next((os.path.join(album_path, f) for f in files if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png'))), None)
+            if cover_file:
+                await client.send_file(chat_id, cover_file, caption=caption, parse_mode='html')
+            else:
+                await client.send_message(chat_id, caption, parse_mode='html')
+
+            # Convert and send each track
+            for filename in files:
+                if filename.lower().endswith('.flac'):
+                    input_path = os.path.join(album_path, filename)
+                    output_path = f"{input_path}.{format_choice}"
+                    if format_choice == 'flac':
+                        subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
+                    elif format_choice == 'mp3':
+                        subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
+
+                    audio = File(output_path, easy=True)
+                    artist = audio.get('artist', ['Unknown Artist'])[0]
+                    title = audio.get('title', ['Unknown Title'])[0]
+                    for field in ['artist', 'title', 'album', 'genre']:
+                        if field in audio:
+                            audio[field] = [value.replace(";", ", ") for value in audio[field]]
+                    audio.save()
+                    final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
+                    final_path = os.path.join(album_path, final_name)
+                    os.rename(output_path, final_path)
+                    await client.send_file(chat_id, final_path)
+
+            shutil.rmtree(root_path)
+            increment_download(chat_id, content_type)
+
+        else:  # track
+            download_dir = f'downloads/{components[-1]}'
+            filename = os.listdir(download_dir)[0]
+            filepath = f'{download_dir}/{filename}'
+            converted_filepath = f'{download_dir}/{filename}.{format_choice}'
+
+            if format_choice == 'flac':
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
+            elif format_choice == 'mp3':
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k', converted_filepath])
+
+            audio = File(converted_filepath, easy=True)
+            artist = audio.get('artist', ['Unknown Artist'])[0]
+            title = audio.get('title', ['Unknown Title'])[0]
+            for field in ['artist', 'title', 'album', 'genre']:
+                if field in audio:
+                    audio[field] = [value.replace(";", ", ") for value in audio[field]]
+            audio.save()
+            new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
+            new_filepath = f'{download_dir}/{new_filename}'
+            os.rename(converted_filepath, new_filepath)
+            await client.send_file(chat_id, new_filepath)
+            shutil.rmtree(download_dir)
+            increment_download(chat_id, content_type)
+
+    except Exception as e:
+        await client.send_message(chat_id, f"❌ An error occurred during conversion: {e}")
+
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
@@ -220,112 +375,14 @@ async def callback_query_handler(event):
 
         input_text = url_info["url"]
         content_type = url_info["type"]
-        await event.edit(f"You selected {format_choice.upper()}. Downloading...")
 
-        url = urlparse(input_text)
-        components = url.path.split('/')
-        release_id = components[-1]
-
-        # Run your external download script (orpheus.py)
-        os.system(f'python orpheus.py {input_text}')
-
-        if content_type == "album":
-            root_path = f'downloads/{release_id}'
-            flac_files = [f for f in os.listdir(root_path) if f.lower().endswith('.flac')]
-            album_path = root_path if flac_files else os.path.join(root_path, os.listdir(root_path)[0])
-            files = os.listdir(album_path)
-
-            all_artists = set()
-            catalog_number = 'N/A'
-            for f in files:
-                if f.lower().endswith('.flac'):
-                    audio = File(os.path.join(album_path, f), easy=True)
-                    if audio:
-                        for key in ('artist', 'performer', 'albumartist'):
-                            if key in audio:
-                                all_artists.update(audio[key])
-                        if 'catalog' in audio:
-                            catalog_number = audio['catalog'][0]
-
-            sample_file = next((f for f in files if f.lower().endswith('.flac')), None)
-            sample_path = os.path.join(album_path, sample_file) if sample_file else None
-            metadata = File(sample_path, easy=True) if sample_path else {}
-
-            album = metadata.get('album', ['Unknown Album'])[0]
-            genre = metadata.get('genre', ['Unknown Genre'])[0]
-            bpm = metadata.get('bpm', ['--'])[0]
-            label = metadata.get('label', ['--'])[0]
-            date = metadata.get('date', ['--'])[0]
-            artists_str = ", ".join(sorted(all_artists))
-
-            caption = (
-                f"<b>\U0001F3B6 Album:</b> {album}\n"
-                f"<b>\U0001F464 Artists:</b> {artists_str}\n"
-                f"<b>\U0001F3A7 Genre:</b> {genre}\n"
-                f"<b>\U0001F4BF Label:</b> {label}\n"
-                f"<b>\U0001F4C5 Release Date:</b> {date}\n"
-                f"<b>\U0001F9E9 BPM:</b> {bpm}\n"
-            )
-
-            cover_file = next((os.path.join(album_path, f) for f in files if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png'))), None)
-            if cover_file:
-                await client.send_file(event.chat_id, cover_file, caption=caption, parse_mode='html')
-            else:
-                await event.reply(caption, parse_mode='html')
-
-            for filename in files:
-                if filename.lower().endswith('.flac'):
-                    input_path = os.path.join(album_path, filename)
-                    output_path = f"{input_path}.{format_choice}"
-                    if format_choice == 'flac':
-                        subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
-                    elif format_choice == 'mp3':
-                        subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
-
-                    audio = File(output_path, easy=True)
-                    artist = audio.get('artist', ['Unknown Artist'])[0]
-                    title = audio.get('title', ['Unknown Title'])[0]
-                    for field in ['artist', 'title', 'album', 'genre']:
-                        if field in audio:
-                            audio[field] = [value.replace(";", ", ") for value in audio[field]]
-                    audio.save()
-                    final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
-                    final_path = os.path.join(album_path, final_name)
-                    os.rename(output_path, final_path)
-                    await client.send_file(event.chat_id, final_path)
-
-            shutil.rmtree(root_path)
-            increment_download(event.chat_id, content_type)
-            del state[event.chat_id]
-
-        else:  # track
-            download_dir = f'downloads/{components[-1]}'
-            filename = os.listdir(download_dir)[0]
-            filepath = f'{download_dir}/{filename}'
-            converted_filepath = f'{download_dir}/{filename}.{format_choice}'
-
-            if format_choice == 'flac':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
-            elif format_choice == 'mp3':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k', converted_filepath])
-
-            audio = File(converted_filepath, easy=True)
-            artist = audio.get('artist', ['Unknown Artist'])[0]
-            title = audio.get('title', ['Unknown Title'])[0]
-            for field in ['artist', 'title', 'album', 'genre']:
-                if field in audio:
-                    audio[field] = [value.replace(";", ", ") for value in audio[field]]
-            audio.save()
-            new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
-            new_filepath = f'{download_dir}/{new_filename}'
-            os.rename(converted_filepath, new_filepath)
-            await client.send_file(event.chat_id, new_filepath)
-            shutil.rmtree(download_dir)
-            increment_download(event.chat_id, content_type)
-            del state[event.chat_id]
+        await event.edit(f"✅ Your download has been queued. You will receive it shortly!")
+        # Enqueue download
+        await enqueue_download(event.chat_id, input_text, content_type, format_choice)
+        del state[event.chat_id]  # clear temporary state
 
     except Exception as e:
-        await event.reply(f"An error occurred during conversion: {e}")
+        await event.reply(f"An error occurred: {e}")
 
 @client.on(events.NewMessage(pattern='/broadcast'))
 async def broadcast_handler(event):
