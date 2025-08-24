@@ -24,67 +24,27 @@ ADMIN_IDS = [616584208, 731116951, 769363217]
 PAYMENT_URL = "https://ko-fi.com/zackant"
 USERS_FILE = 'users.json'
 
-download_queue = deque()
+
+
+# === GLOBAL QUEUE ===
+download_queue = asyncio.Queue()
 is_downloading = False
-queue_lock = asyncio.Lock()
 
-async def enqueue_download(chat_id, url, content_type, format_choice):
-    """
-    Add a download request to the queue.
-    """
-    global download_queue
-    download_queue.append((chat_id, url, content_type, format_choice))
-    async with queue_lock:
-        await process_queue()
-
-
-async def process_queue():
-    """
-    Process the download queue sequentially (for Orpheus safety).
-    Conversion + sending runs in background.
-    """
-    global is_downloading
-    while download_queue:
-        if is_downloading:
-            break  # Already processing one download, wait
-        is_downloading = True
-        chat_id, url, content_type, format_choice = download_queue.popleft()
-        try:
-            await client.send_message(chat_id, "🎶 Your download has started, please wait...")
-            await run_orpheus(url, content_type, format_choice, chat_id)
-        except Exception as e:
-            await client.send_message(chat_id, f"❌ Error during download: {e}")
-        finally:
-            is_downloading = False
+# === Helper: safe parallel file sending ===
+async def safe_send_file(chat_id, path, caption=None):
+    try:
+        await client.send_file(
+            chat_id,
+            path,
+            caption=caption,
+            parse_mode='html' if caption else None
+        )
+    except Exception as e:
+        await client.send_message(chat_id, f"❌ Error sending {os.path.basename(path)}: {e}")
 
 
-async def run_orpheus(url, content_type, format_choice, chat_id):
-    """
-    Run Orpheus asynchronously and schedule conversion/sending in background.
-    """
-    process = await asyncio.create_subprocess_exec(
-        'python', 'orpheus.py', url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        raise Exception(stderr.decode())
-
-    # Notify user
-    await client.send_message(chat_id, f"✅ Download finished! Converting & sending in background...")
-
-    # 🔑 Conversion & sending runs in background (does not block the queue)
-    asyncio.create_task(convert_and_send(chat_id, url, content_type, format_choice))
-
-    # Immediately continue queue (next user download can start now)
-    asyncio.create_task(process_queue())
-
-
+# === Conversion + Sending (parallelized) ===
 async def convert_and_send(chat_id, input_text, content_type, format_choice):
-    """
-    Convert downloaded files and send to the user (runs in background).
-    """
     url = urlparse(input_text)
     components = url.path.split('/')
     release_id = components[-1]
@@ -96,6 +56,7 @@ async def convert_and_send(chat_id, input_text, content_type, format_choice):
             album_path = root_path if flac_files else os.path.join(root_path, os.listdir(root_path)[0])
             files = os.listdir(album_path)
 
+            # --- Collect metadata ---
             all_artists = set()
             catalog_number = 'N/A'
             for f in files:
@@ -128,13 +89,17 @@ async def convert_and_send(chat_id, input_text, content_type, format_choice):
                 f"<b>\U0001F9E9 BPM:</b> {bpm}\n"
             )
 
-            cover_file = next((os.path.join(album_path, f) for f in files if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png'))), None)
+            # Send cover image in background
+            cover_file = next(
+                (os.path.join(album_path, f) for f in files if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png'))),
+                None
+            )
             if cover_file:
-                await client.send_file(chat_id, cover_file, caption=caption, parse_mode='html')
+                asyncio.create_task(safe_send_file(chat_id, cover_file, caption=caption))
             else:
                 await client.send_message(chat_id, caption, parse_mode='html')
 
-            # Convert and send each track
+            # Convert & send each track
             for filename in files:
                 if filename.lower().endswith('.flac'):
                     input_path = os.path.join(album_path, filename)
@@ -154,12 +119,14 @@ async def convert_and_send(chat_id, input_text, content_type, format_choice):
                     final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
                     final_path = os.path.join(album_path, final_name)
                     os.rename(output_path, final_path)
-                    await client.send_file(chat_id, final_path)
 
+                    asyncio.create_task(safe_send_file(chat_id, final_path))
+
+            # cleanup
             shutil.rmtree(root_path)
             increment_download(chat_id, content_type)
 
-        else:  # track
+        else:  # single track
             download_dir = f'downloads/{components[-1]}'
             filename = os.listdir(download_dir)[0]
             filepath = f'{download_dir}/{filename}'
@@ -180,12 +147,56 @@ async def convert_and_send(chat_id, input_text, content_type, format_choice):
             new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
             new_filepath = f'{download_dir}/{new_filename}'
             os.rename(converted_filepath, new_filepath)
-            await client.send_file(chat_id, new_filepath)
+
+            asyncio.create_task(safe_send_file(chat_id, new_filepath))
+
             shutil.rmtree(download_dir)
             increment_download(chat_id, content_type)
 
     except Exception as e:
-        await client.send_message(chat_id, f"❌ An error occurred during conversion: {e}")
+        await client.send_message(chat_id, f"❌ Error during conversion: {e}")
+
+
+# === Orpheus runner ===
+async def run_orpheus(chat_id, url, content_type, format_choice):
+    try:
+        # run Orpheus sync in thread
+        process = await asyncio.create_subprocess_exec(
+            "python3", "orpheus.py", url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            await client.send_message(chat_id, f"❌ Download failed:\n{stderr.decode()}")
+        else:
+            # Start conversion+send in background
+            asyncio.create_task(convert_and_send(chat_id, url, content_type, format_choice))
+
+    except Exception as e:
+        await client.send_message(chat_id, f"❌ Error during download: {e}")
+
+
+# === Queue handler ===
+async def process_queue():
+    global is_downloading
+    if is_downloading:
+        return
+    is_downloading = True
+
+    while not download_queue.empty():
+        chat_id, url, content_type, format_choice = await download_queue.get()
+        await run_orpheus(chat_id, url, content_type, format_choice)
+        download_queue.task_done()
+
+    is_downloading = False
+
+
+# === Enqueue download ===
+async def enqueue_download(chat_id, url, content_type, format_choice):
+    await download_queue.put((chat_id, url, content_type, format_choice))
+    await client.send_message(chat_id, "🎶 Your download request is queued.")
+    asyncio.create_task(process_queue())
 
 def load_users():
     if not os.path.exists(USERS_FILE):
