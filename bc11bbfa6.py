@@ -21,6 +21,11 @@ ADMIN_IDS = [616584208, 731116951, 769363217]
 PAYMENT_URL = "https://ko-fi.com/zackant"
 USERS_FILE = 'users.json'
 
+
+
+
+
+
 def load_users():
     if not os.path.exists(USERS_FILE):
         return {}
@@ -104,10 +109,26 @@ async def download_worker():
             await client.send_message(user_id, f"❌ Download failed: {e}")
         finally:
             download_queue.task_done()
+
+async def run_cmd(cmd):
+    """
+    Run a shell command asynchronously.
+    """
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise Exception(stderr.decode())
+    return stdout.decode()
+
+
 async def process_download(user_id, input_text, content_type, format_choice):
     """
     Handles the actual Orpheus download + conversion + sending files.
-    Runs in the queue worker, one at a time.
+    Runs in the queue worker, non-blocking.
     """
     try:
         await client.send_message(user_id, f"⏳ Downloading your {content_type} in {format_choice.upper()}...")
@@ -116,8 +137,8 @@ async def process_download(user_id, input_text, content_type, format_choice):
         components = url.path.split('/')
         release_id = components[-1]
 
-        # Run Orpheus download
-        os.system(f'python orpheus.py {input_text}')
+        # Run Orpheus download (async, non-blocking)
+        await run_cmd(["python3", "orpheus.py", input_text])
 
         if content_type == "album":
             root_path = f'downloads/{release_id}'
@@ -164,10 +185,11 @@ async def process_download(user_id, input_text, content_type, format_choice):
                 if filename.lower().endswith('.flac'):
                     input_path = os.path.join(album_path, filename)
                     output_path = f"{input_path}.{format_choice}"
+
                     if format_choice == 'flac':
-                        subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
+                        await run_cmd(['ffmpeg', '-n', '-i', input_path, output_path])
                     elif format_choice == 'mp3':
-                        subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
+                        await run_cmd(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
 
                     audio = File(output_path, easy=True)
                     artist = audio.get('artist', ['Unknown Artist'])[0]
@@ -191,9 +213,9 @@ async def process_download(user_id, input_text, content_type, format_choice):
             converted_filepath = f'{download_dir}/{filename}.{format_choice}'
 
             if format_choice == 'flac':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
+                await run_cmd(['ffmpeg', '-n', '-i', filepath, converted_filepath])
             elif format_choice == 'mp3':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k', converted_filepath])
+                await run_cmd(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k', converted_filepath])
 
             audio = File(converted_filepath, easy=True)
             artist = audio.get('artist', ['Unknown Artist'])[0]
@@ -211,7 +233,6 @@ async def process_download(user_id, input_text, content_type, format_choice):
 
     except Exception as e:
         await client.send_message(user_id, f"❌ Error while processing download: {e}")
-
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
@@ -522,11 +543,24 @@ async def alert_expiry_handler(event):
         parse_mode='html'
     )
     
-async def main():
-    asyncio.create_task(download_worker())  # start queue worker
-    async with client:
-        print("✅ Bot is running...")
-        await client.run_until_disconnected()
+MAX_WORKERS = 3  # run up to 3 downloads at the same time
 
-if __name__ == '__main__':
-    client.loop.run_until_complete(main())
+async def download_worker(worker_id):
+    while True:
+        user_id, input_text, content_type, format_choice = await download_queue.get()
+        try:
+            await client.send_message(user_id, f"▶️ Worker-{worker_id} is starting your download...")
+            await process_download(user_id, input_text, content_type, format_choice)
+        except Exception as e:
+            await client.send_message(user_id, f"❌ Download failed: {e}")
+        finally:
+            download_queue.task_done()
+
+async def main():
+    # Start multiple workers
+    for i in range(MAX_WORKERS):
+        asyncio.create_task(download_worker(i+1))
+
+    async with client:
+        print("✅ Bot is running with parallel workers...")
+        await client.run_until_disconnected()
