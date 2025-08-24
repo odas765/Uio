@@ -7,6 +7,13 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from telethon import TelegramClient, events, Button
 from mutagen import File
+import asyncio
+from collections import deque
+
+# === DOWNLOAD QUEUE VARIABLES ===
+download_queue = deque()
+is_downloading = False
+queue_lock = asyncio.Lock()
 
 api_id = '10074048'
 api_hash = 'a08b1ed3365fa3b04bcf2bcbf71aff4d'
