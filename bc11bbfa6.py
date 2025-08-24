@@ -3,17 +3,10 @@ import re
 import shutil
 import subprocess
 import json
-import asyncio
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from telethon import TelegramClient, events, Button
 from mutagen import File
-
-
-
-download_lock = asyncio.Lock()
-download_queue = asyncio.Queue()
-state = {}  # user_id -> {"url":..., "type":...}
 
 api_id = '10074048'
 api_hash = 'a08b1ed3365fa3b04bcf2bcbf71aff4d'
@@ -93,55 +86,6 @@ def remove_user(user_id):
     return False
 
 client = TelegramClient(session_name, api_id, api_hash)
-
-async def process_queue():
-    while True:
-        user_id, url, content_type, format_choice = await download_queue.get()
-        try:
-            async with download_lock:
-                await client.send_message(user_id, f"⬇️ Downloading your {content_type}...")
-
-                release_id = url.split('/')[-1]
-                user_folder = f'downloads/{user_id}/{release_id}'
-                os.makedirs(user_folder, exist_ok=True)
-
-                async def convert_and_send_files(user_id, folder_path, content_type, format_choice):
-    files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.flac', '.wav', '.mp3'))]
-
-    for filename in files:
-        input_path = os.path.join(folder_path, filename)
-        output_path = os.path.join(folder_path, f"{filename}.{format_choice}")
-
-        if format_choice == 'flac':
-            subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
-        elif format_choice == 'mp3':
-            subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
-
-        audio = File(output_path, easy=True)
-        if audio:
-            for field in ['artist', 'title', 'album', 'genre']:
-                if field in audio:
-                    audio[field] = [v.replace(';', ', ') for v in audio[field]]
-            audio.save()
-
-        final_name = f"{audio.get('artist',['Unknown'])[0]} - {audio.get('title',['Unknown'])[0]}.{format_choice}"
-        final_path = os.path.join(folder_path, final_name)
-        os.rename(output_path, final_path)
-
-        await client.send_file(user_id, final_path)
-
-    shutil.rmtree(folder_path)
-    increment_download(user_id, content_type)
-
-                # Run Orpheus download (blocking)
-                subprocess.run(['python', 'orpheus.py', url, '--output', user_folder], check=True)
-
-            await convert_and_send_files(user_id, user_folder, content_type, format_choice)
-
-        except Exception as e:
-            await client.send_message(user_id, f"❌ Error during download/conversion: {e}")
-        finally:
-            download_queue.task_done()
 
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
@@ -239,162 +183,149 @@ async def myaccount_handler(event):
 
 @client.on(events.NewMessage(pattern='/download'))
 async def download_handler(event):
-    user_id = event.sender_id
     try:
+        user_id = event.chat_id
         input_text = event.message.text.split(maxsplit=1)[1].strip()
         is_track = re.match(beatport_track_pattern, input_text)
         is_album = re.match(beatport_album_pattern, input_text)
 
-        if not (is_track or is_album):
-            await event.reply('❌ Invalid Beatport URL.')
-            return
+        if is_track or is_album:
+            content_type = 'album' if is_album else 'track'
 
-        content_type = 'album' if is_album else 'track'
+            if not is_user_allowed(user_id, content_type):
+                await event.reply(
+                    "🚫 You've reached today's free download limit (2 albums / 2 tracks).\n"
+                    "To unlock unlimited downloads for 30 days, please support with a $5 payment and send the proof to @zackantdev",
+                    buttons=[Button.url("💳 Pay $5", PAYMENT_URL)]
+                )
+                return
 
-        if not is_user_allowed(user_id, content_type):
-            await event.reply(
-                "🚫 You've reached today's free download limit.\n"
-                "💳 Unlock unlimited downloads via support.",
-                buttons=[Button.url("💳 Pay $5", PAYMENT_URL)]
-            )
-            return
-
-        state[user_id] = {"url": input_text, "type": content_type}
-        await event.reply("Select format:", buttons=[
-            [Button.inline("MP3 (320 kbps)", b"mp3"), Button.inline("FLAC (16 Bit)", b"flac")]
-        ])
+            state[event.chat_id] = {"url": input_text, "type": content_type}
+            await event.reply("Please choose the format:", buttons=[
+                [Button.inline("MP3 (320 kbps)", b"mp3"), Button.inline("FLAC (16 Bit)", b"flac")]
+            ])
+        else:
+            await event.reply('Invalid link.\nPlease send a valid Beatport track or album URL.')
     except Exception as e:
-        await event.reply(f"❌ Error: {e}")
-
+        await event.reply(f"An error occurred: {e}")
 
 @client.on(events.CallbackQuery)
 async def callback_query_handler(event):
-    user_id = event.sender_id
     try:
         format_choice = event.data.decode('utf-8')
-        url_info = state.pop(user_id, None)
+        url_info = state.get(event.chat_id)
         if not url_info:
-            await event.edit("❌ No URL found. Please start again using /download.")
+            await event.edit("No URL found. Please start again using /download.")
             return
 
-        # Add to queue
-        await download_queue.put((user_id, url_info["url"], url_info["type"], format_choice))
-        await event.edit(f"✅ Your {url_info['type']} has been queued. You will receive it soon!")
+        input_text = url_info["url"]
+        content_type = url_info["type"]
+        await event.edit(f"You selected {format_choice.upper()}. Downloading...")
 
-    except Exception as e:
-        await event.edit(f"❌ Error: {e}")
+        url = urlparse(input_text)
+        components = url.path.split('/')
+        release_id = components[-1]
 
-async def process_queue():
-    while True:
-        user_id, input_text, content_type, format_choice = await download_queue.get()
-        async with download_lock:
-            try:
-                # Inform user that download started
-                await client.send_message(user_id, f"🚀 Downloading your {content_type} now...")
+        # Run your external download script (orpheus.py)
+        os.system(f'python orpheus.py {input_text}')
 
-                # Parse release_id
-                url = urlparse(input_text)
-                release_id = url.path.split('/')[-1]
+        if content_type == "album":
+            root_path = f'downloads/{release_id}'
+            flac_files = [f for f in os.listdir(root_path) if f.lower().endswith('.flac')]
+            album_path = root_path if flac_files else os.path.join(root_path, os.listdir(root_path)[0])
+            files = os.listdir(album_path)
 
-                # Run Orpheus download
-                os.system(f'python orpheus.py {input_text}')
+            all_artists = set()
+            catalog_number = 'N/A'
+            for f in files:
+                if f.lower().endswith('.flac'):
+                    audio = File(os.path.join(album_path, f), easy=True)
+                    if audio:
+                        for key in ('artist', 'performer', 'albumartist'):
+                            if key in audio:
+                                all_artists.update(audio[key])
+                        if 'catalog' in audio:
+                            catalog_number = audio['catalog'][0]
 
-                # Determine download path
-                download_path = f'downloads/{release_id}'
-                if content_type == 'album':
-                    flac_files = [f for f in os.listdir(download_path) if f.lower().endswith('.flac')]
-                    album_path = download_path if flac_files else os.path.join(download_path, os.listdir(download_path)[0])
-                    files = os.listdir(album_path)
+            sample_file = next((f for f in files if f.lower().endswith('.flac')), None)
+            sample_path = os.path.join(album_path, sample_file) if sample_file else None
+            metadata = File(sample_path, easy=True) if sample_path else {}
 
-                    # Send album metadata first
-                    all_artists = set()
-                    sample_file = next((f for f in files if f.lower().endswith('.flac')), None)
-                    sample_path = os.path.join(album_path, sample_file) if sample_file else None
-                    metadata = File(sample_path, easy=True) if sample_path else {}
-                    album = metadata.get('album', ['Unknown Album'])[0]
-                    genre = metadata.get('genre', ['Unknown Genre'])[0]
-                    bpm = metadata.get('bpm', ['--'])[0]
-                    label = metadata.get('label', ['--'])[0]
-                    date = metadata.get('date', ['--'])[0]
-                    for f in files:
-                        if f.lower().endswith('.flac'):
-                            audio = File(os.path.join(album_path, f), easy=True)
-                            if audio:
-                                for key in ('artist', 'performer', 'albumartist'):
-                                    if key in audio:
-                                        all_artists.update(audio[key])
-                    artists_str = ", ".join(sorted(all_artists))
-                    caption = (
-                        f"<b>🎶 Album:</b> {album}\n"
-                        f"<b>👤 Artists:</b> {artists_str}\n"
-                        f"<b>🎧 Genre:</b> {genre}\n"
-                        f"<b>💿 Label:</b> {label}\n"
-                        f"<b>📅 Release Date:</b> {date}\n"
-                        f"<b>🎵 BPM:</b> {bpm}\n"
-                    )
-                    cover_file = next((os.path.join(album_path, f) for f in files if f.lower().startswith('cover') and f.lower().endswith(('.jpg','.jpeg','.png'))), None)
-                    if cover_file:
-                        await client.send_file(user_id, cover_file, caption=caption, parse_mode='html')
-                    else:
-                        await client.send_message(user_id, caption, parse_mode='html')
+            album = metadata.get('album', ['Unknown Album'])[0]
+            genre = metadata.get('genre', ['Unknown Genre'])[0]
+            bpm = metadata.get('bpm', ['--'])[0]
+            label = metadata.get('label', ['--'])[0]
+            date = metadata.get('date', ['--'])[0]
+            artists_str = ", ".join(sorted(all_artists))
 
-                    # Convert and send files
-                    for filename in files:
-                        if filename.lower().endswith('.flac'):
-                            input_file = os.path.join(album_path, filename)
-                            output_file = f"{input_file}.{format_choice}"
-                            if format_choice == 'mp3':
-                                subprocess.run(['ffmpeg','-n','-i',input_file,'-b:a','320k',output_file])
-                            else:
-                                subprocess.run(['ffmpeg','-n','-i',input_file,output_file])
+            caption = (
+                f"<b>\U0001F3B6 Album:</b> {album}\n"
+                f"<b>\U0001F464 Artists:</b> {artists_str}\n"
+                f"<b>\U0001F3A7 Genre:</b> {genre}\n"
+                f"<b>\U0001F4BF Label:</b> {label}\n"
+                f"<b>\U0001F4C5 Release Date:</b> {date}\n"
+                f"<b>\U0001F9E9 BPM:</b> {bpm}\n"
+            )
 
-                            audio = File(output_file, easy=True)
-                            artist = audio.get('artist', ['Unknown Artist'])[0]
-                            title = audio.get('title', ['Unknown Title'])[0]
-                            for field in ['artist','title','album','genre']:
-                                if field in audio:
-                                    audio[field] = [v.replace(";",", ") for v in audio[field]]
-                            audio.save()
-                            final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
-                            final_path = os.path.join(album_path, final_name)
-                            os.rename(output_file, final_path)
-                            await client.send_file(user_id, final_path)
+            cover_file = next((os.path.join(album_path, f) for f in files if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png'))), None)
+            if cover_file:
+                await client.send_file(event.chat_id, cover_file, caption=caption, parse_mode='html')
+            else:
+                await event.reply(caption, parse_mode='html')
 
-                    shutil.rmtree(download_path)
-                    increment_download(user_id, content_type)
+            for filename in files:
+                if filename.lower().endswith('.flac'):
+                    input_path = os.path.join(album_path, filename)
+                    output_path = f"{input_path}.{format_choice}"
+                    if format_choice == 'flac':
+                        subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
+                    elif format_choice == 'mp3':
+                        subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
 
-                else:  # track
-                    download_dir = f'downloads/{release_id}'
-                    filename = os.listdir(download_dir)[0]
-                    input_file = f'{download_dir}/{filename}'
-                    output_file = f'{input_file}.{format_choice}'
-
-                    if format_choice == 'mp3':
-                        subprocess.run(['ffmpeg','-n','-i',input_file,'-b:a','320k',output_file])
-                    else:
-                        subprocess.run(['ffmpeg','-n','-i',input_file,output_file])
-
-                    audio = File(output_file, easy=True)
+                    audio = File(output_path, easy=True)
                     artist = audio.get('artist', ['Unknown Artist'])[0]
                     title = audio.get('title', ['Unknown Title'])[0]
-                    for field in ['artist','title','album','genre']:
+                    for field in ['artist', 'title', 'album', 'genre']:
                         if field in audio:
-                            audio[field] = [v.replace(";",", ") for v in audio[field]]
+                            audio[field] = [value.replace(";", ", ") for value in audio[field]]
                     audio.save()
                     final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
-                    final_path = f'{download_dir}/{final_name}'
-                    os.rename(output_file, final_path)
-                    await client.send_file(user_id, final_path)
-                    shutil.rmtree(download_dir)
-                    increment_download(user_id, content_type)
+                    final_path = os.path.join(album_path, final_name)
+                    os.rename(output_path, final_path)
+                    await client.send_file(event.chat_id, final_path)
 
-            except Exception as e:
-                await client.send_message(user_id, f"❌ Error during download: {e}")
+            shutil.rmtree(root_path)
+            increment_download(event.chat_id, content_type)
+            del state[event.chat_id]
 
-        download_queue.task_done()
+        else:  # track
+            download_dir = f'downloads/{components[-1]}'
+            filename = os.listdir(download_dir)[0]
+            filepath = f'{download_dir}/{filename}'
+            converted_filepath = f'{download_dir}/{filename}.{format_choice}'
 
+            if format_choice == 'flac':
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
+            elif format_choice == 'mp3':
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k', converted_filepath])
 
+            audio = File(converted_filepath, easy=True)
+            artist = audio.get('artist', ['Unknown Artist'])[0]
+            title = audio.get('title', ['Unknown Title'])[0]
+            for field in ['artist', 'title', 'album', 'genre']:
+                if field in audio:
+                    audio[field] = [value.replace(";", ", ") for value in audio[field]]
+            audio.save()
+            new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
+            new_filepath = f'{download_dir}/{new_filename}'
+            os.rename(converted_filepath, new_filepath)
+            await client.send_file(event.chat_id, new_filepath)
+            shutil.rmtree(download_dir)
+            increment_download(event.chat_id, content_type)
+            del state[event.chat_id]
 
+    except Exception as e:
+        await event.reply(f"An error occurred during conversion: {e}")
 
 @client.on(events.NewMessage(pattern='/broadcast'))
 async def broadcast_handler(event):
@@ -551,11 +482,7 @@ async def alert_expiry_handler(event):
         parse_mode='html'
     )
     
-
 async def main():
-    # Start queue processor
-    asyncio.create_task(process_queue())
-    
     async with client:
         print("Client is running...")
         await client.run_until_disconnected()
