@@ -94,6 +94,10 @@ def remove_user(user_id):
 
 client = TelegramClient(session_name, api_id, api_hash)
 
+# ======================
+# Download Queue System
+# ======================
+
 async def enqueue_download(chat_id, url, content_type, format_choice):
     """
     Add a download request to the queue.
@@ -127,7 +131,6 @@ async def run_orpheus(url, content_type, format_choice, chat_id):
     """
     Run Orpheus asynchronously and handle post-processing.
     """
-    # Run orpheus.py as subprocess
     process = await asyncio.create_subprocess_exec(
         'python', 'orpheus.py', url,
         stdout=asyncio.subprocess.PIPE,
@@ -136,12 +139,13 @@ async def run_orpheus(url, content_type, format_choice, chat_id):
     stdout, stderr = await process.communicate()
     if process.returncode != 0:
         raise Exception(stderr.decode())
-    
-    # Call your existing conversion & sending logic here
-    # Example placeholder:
+
+    # Notify user
     await client.send_message(chat_id, f"✅ Download finished! Now converting to {format_choice.upper()}...")
-    
-    # Here you can call your existing MP3/FLAC conversion and sending 
+
+    # 🔑 Convert and send files to user
+    await convert_and_send(chat_id, url, content_type, format_choice)
+
 
 async def convert_and_send(chat_id, input_text, content_type, format_choice):
     """
@@ -155,9 +159,11 @@ async def convert_and_send(chat_id, input_text, content_type, format_choice):
         if content_type == "album":
             root_path = f'downloads/{release_id}'
             flac_files = [f for f in os.listdir(root_path) if f.lower().endswith('.flac')]
-            album_path = root_path if flac_files else os.path.join(root_path, os.listdir(root_path)[0])
+            subdirs = [d for d in os.listdir(root_path) if os.path.isdir(os.path.join(root_path, d))]
+            album_path = root_path if flac_files else os.path.join(root_path, subdirs[0])
             files = os.listdir(album_path)
 
+            # Collect metadata
             all_artists = set()
             catalog_number = 'N/A'
             for f in files:
