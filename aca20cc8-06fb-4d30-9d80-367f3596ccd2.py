@@ -102,12 +102,7 @@ client = TelegramClient(session_name, api_id, api_hash)
 # Download Queue System
 # ======================
 
-import asyncio
-import os
-import shutil
-import subprocess
-from urllib.parse import urlparse
-from mutagen import File
+
 
 # === GLOBAL QUEUE ===
 download_queue = asyncio.Queue()
