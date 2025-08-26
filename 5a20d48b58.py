@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 import json
+import asyncio, time
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from telethon import TelegramClient, events, Button
@@ -135,6 +136,38 @@ async def process_queue():
 
     orpheus_running = False
 
+
+
+# --------------------
+# Per-user duplicate send guard
+sent_files = {}  # {chat_id: {file_path: timestamp}}
+CLEANUP_INTERVAL = 300   # 5 minutes
+EXPIRY_TIME = 600        # 10 minutes
+
+async def cleanup_sent_files():
+    while True:
+        now = time.time()
+        expired_data = {}
+        for chat_id, files in sent_files.items():
+            expired = [f for f, t in files.items() if now - t > EXPIRY_TIME]
+            for f in expired:
+                del files[f]
+            if not files:
+                expired_data[chat_id] = True
+        for cid in expired_data.keys():
+            del sent_files[cid]
+        await asyncio.sleep(CLEANUP_INTERVAL)
+
+async def safe_send_file(chat_id, file, **kwargs):
+    """Send file only if not already sent recently to THIS chat"""
+    if chat_id not in sent_files:
+        sent_files[chat_id] = {}
+    if file not in sent_files[chat_id]:
+        await client.send_file(chat_id, file, **kwargs)
+        sent_files[chat_id][file] = time.time()
+# --------------------
+
+
 async def handle_conversion_and_sending(event, format_choice, input_text, content_type):
     try:
         from urllib.parse import urlparse
@@ -237,7 +270,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                         cover_file = os.path.join(root, f)
                         break
             if cover_file:
-                await client.send_file(event.chat_id, cover_file, caption=caption, parse_mode='html')
+                await safe_send_file(event.chat_id, cover_file, caption=caption, parse_mode='html')
             else:
                 await event.reply(caption, parse_mode='html')
 
@@ -259,7 +292,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
                 final_path = os.path.join(os.path.dirname(input_path), final_name)
                 os.rename(output_path, final_path)
-                await client.send_file(event.chat_id, final_path)
+                await safe_send_file(event.chat_id, final_path)
 
             shutil.rmtree(root_path)
             increment_download(event.chat_id, content_type)
@@ -286,7 +319,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
             new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
             new_filepath = f'{download_dir}/{new_filename}'
             os.rename(converted_filepath, new_filepath)
-            await client.send_file(event.chat_id, new_filepath)
+            await safe_send_file(event.chat_id, new_filepath)
             shutil.rmtree(download_dir)
             increment_download(event.chat_id, content_type)
             del state[event.chat_id]
@@ -623,10 +656,14 @@ async def alert_expiry_handler(event):
         f"✅ Expiry alerts sent to <b>{notified}</b> users.\n❌ Failed for <b>{failed}</b> users.",
         parse_mode='html'
     )
-    
+
 async def main():
     async with client:
         print("Client is running...")
+
+        # Start background cleanup task
+        asyncio.create_task(cleanup_sent_files())
+
         await client.run_until_disconnected()
 
 if __name__ == '__main__':
