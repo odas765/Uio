@@ -139,7 +139,8 @@ async def process_queue():
 
 
 # --------------------
-# Per-user duplicate send guard
+# Per-user duplicate send guar
+
 sent_files = {}  # {chat_id: {file_path: timestamp}}
 CLEANUP_INTERVAL = 300   # 5 minutes
 EXPIRY_TIME = 600        # 10 minutes
@@ -165,71 +166,68 @@ async def safe_send_file(chat_id, file, **kwargs):
     if file not in sent_files[chat_id]:
         await client.send_file(chat_id, file, **kwargs)
         sent_files[chat_id][file] = time.time()
-# --------------------
+# ----------------
 
 
 async def handle_conversion_and_sending(event, format_choice, input_text, content_type):
+    from urllib.parse import urlparse
+    import os, subprocess, shutil
+    from mutagen import File
+    from datetime import datetime
+
+    url = urlparse(input_text)
+    release_id = url.path.split("/")[-1]
+    root_path = f"downloads/{release_id}"
+
     try:
-        from urllib.parse import urlparse
-        import os, subprocess, shutil
-        from mutagen import File
-        from datetime import datetime
-
-        url = urlparse(input_text)
-        components = url.path.split('/')
-        release_id = components[-1]
-
-        # Handle ALBUM, TRACK, PLAYLIST, CHART
         if content_type in ["album", "playlist", "chart"]:
-            root_path = f'downloads/{release_id}'
             if not os.path.exists(root_path):
-                await event.reply("Download folder not found, something went wrong.")
+                print(f"[WARN] Folder not found for {release_id}")
                 return
 
-            # Use subfolder as actual title if exists (for playlists/charts)
             subfolders = [f.path for f in os.scandir(root_path) if f.is_dir()]
             main_folder = subfolders[0] if subfolders else root_path
             title_name = os.path.basename(main_folder) if content_type in ["playlist", "chart"] else None
 
-            # Collect all FLAC files recursively
             flac_files = []
             for root, _, files in os.walk(main_folder):
-                flac_files.extend([os.path.join(root, f) for f in files if f.lower().endswith('.flac')])
+                for f in files:
+                    if f.lower().endswith(".flac"):
+                        flac_files.append(os.path.join(root, f))
 
             if not flac_files:
-                await event.reply("No FLAC files found in download.")
+                print(f"[WARN] No FLACs in {release_id}")
                 return
 
-            # Metadata aggregation for playlist/chart
             all_artists = "Various Artists" if content_type in ["playlist", "chart"] else set()
             genres, labels, dates, bpms = set(), set(), [], []
 
             for f in flac_files:
-                audio = File(f, easy=True)
-                if audio:
-                    if content_type not in ["playlist", "chart"]:
-                        for key in ('artist', 'performer', 'albumartist'):
-                            if key in audio:
-                                all_artists.update(audio[key])
-                    # genres
-                    if 'genre' in audio:
-                        genres.update(audio['genre'])
-                    # labels
-                    if 'label' in audio:
-                        labels.update(audio['label'])
-                    # dates
-                    if 'date' in audio:
-                        try:
-                            d = datetime.strptime(audio['date'][0], '%Y-%m-%d')
-                            dates.append(d)
-                        except: 
-                            pass
-                    # bpms
-                    if 'bpm' in audio:
-                        try:
-                            bpms.append(float(audio['bpm'][0]))
-                        except:
-                            pass
+                try:
+                    audio = File(f, easy=True)
+                    if audio:
+                        if content_type not in ["playlist", "chart"]:
+                            for key in ("artist", "performer", "albumartist"):
+                                if key in audio:
+                                    all_artists.update(audio[key])
+                        if "genre" in audio:
+                            genres.update(audio["genre"])
+                        if "label" in audio:
+                            labels.update(audio["label"])
+                        if "date" in audio:
+                            try:
+                                d = datetime.strptime(audio["date"][0], "%Y-%m-%d")
+                                dates.append(d)
+                            except:
+                                pass
+                        if "bpm" in audio:
+                            try:
+                                bpms.append(float(audio["bpm"][0]))
+                            except:
+                                pass
+                except Exception as meta_err:
+                    print(f"[ERROR] Metadata read error {f}: {meta_err}")
+                    continue
 
             if content_type not in ["playlist", "chart"]:
                 artists_str = ", ".join(sorted(all_artists)) or "Various Artists"
@@ -239,94 +237,99 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
             genre_str = ", ".join(sorted(genres)) if genres else "Unknown Genre"
             label_str = ", ".join(sorted(labels)) if labels else "--"
             if dates:
-                date_str = f"{min(dates).strftime('%Y-%m-%d')} - {max(dates).strftime('%Y-%m-%d')}" if len(dates) > 1 else dates[0].strftime('%Y-%m-%d')
+                date_str = (
+                    f"{min(dates).strftime('%Y-%m-%d')} - {max(dates).strftime('%Y-%m-%d')}"
+                    if len(dates) > 1 else dates[0].strftime("%Y-%m-%d")
+                )
             else:
                 date_str = "--"
-            if bpms:
-                bpm_str = f"{int(min(bpms))}-{int(max(bpms))}" if len(bpms) > 1 else str(int(bpms[0]))
-            else:
-                bpm_str = "--"
+            bpm_str = f"{int(min(bpms))}-{int(max(bpms))}" if len(bpms) > 1 else (str(int(bpms[0])) if bpms else "--")
 
-            # For albums, use album metadata
             if content_type == "album":
                 sample_file = flac_files[0]
                 metadata = File(sample_file, easy=True) or {}
-                title_name = metadata.get('album', ['Unknown Album'])[0]
+                title_name = metadata.get("album", ["Unknown Album"])[0]
 
             caption = (
-                f"<b>\U0001F3B6 {content_type.capitalize()}:</b> {title_name}\n"
-                f"<b>\U0001F464 Artists:</b> {artists_str}\n"
-                f"<b>\U0001F3A7 Genre:</b> {genre_str}\n"
-                f"<b>\U0001F4BF Label:</b> {label_str}\n"
-                f"<b>\U0001F4C5 Release Date:</b> {date_str}\n"
-                f"<b>\U0001F9E9 BPM:</b> {bpm_str}\n"
+                f"<b>🎶 {content_type.capitalize()}:</b> {title_name}\n"
+                f"<b>👤 Artists:</b> {artists_str}\n"
+                f"<b>🎧 Genre:</b> {genre_str}\n"
+                f"<b>💿 Label:</b> {label_str}\n"
+                f"<b>📅 Release Date:</b> {date_str}\n"
+                f"<b>🧩 BPM:</b> {bpm_str}\n"
             )
 
-            # Try to send cover if present
             cover_file = None
             for root, _, files in os.walk(main_folder):
                 for f in files:
-                    if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    if f.lower().startswith("cover") and f.lower().endswith((".jpg", ".jpeg", ".png")):
                         cover_file = os.path.join(root, f)
                         break
             if cover_file:
-                await safe_send_file(event.chat_id, cover_file, caption=caption, parse_mode='html')
+                await safe_send_file(event.chat_id, cover_file, caption=caption, parse_mode="html")
             else:
-                await event.reply(caption, parse_mode='html')
+                await event.respond(caption, parse_mode="html")
 
-            # Convert & send all tracks
             for input_path in flac_files:
-                output_path = f"{input_path}.{format_choice}"
-                if format_choice == 'flac':
-                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
-                elif format_choice == 'mp3':
-                    subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
+                try:
+                    output_path = f"{input_path}.{format_choice}"
+                    if format_choice == "flac":
+                        subprocess.run(["ffmpeg", "-y", "-i", input_path, output_path])
+                    elif format_choice == "mp3":
+                        subprocess.run(["ffmpeg", "-y", "-i", input_path, "-b:a", "320k", output_path])
 
-                audio = File(output_path, easy=True)
-                artist = audio.get('artist', ['Unknown Artist'])[0]
-                title = audio.get('title', ['Unknown Title'])[0]
-                for field in ['artist', 'title', 'album', 'genre']:
+                    audio = File(output_path, easy=True)
+                    artist = audio.get("artist", ["Unknown Artist"])[0]
+                    title = audio.get("title", ["Unknown Title"])[0]
+                    for field in ["artist", "title", "album", "genre"]:
+                        if field in audio:
+                            audio[field] = [value.replace(";", ", ") for value in audio[field]]
+                    audio.save()
+                    final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
+                    final_path = os.path.join(os.path.dirname(input_path), final_name)
+                    os.rename(output_path, final_path)
+                    await safe_send_file(event.chat_id, final_path)
+                except Exception as track_err:
+                    print(f"[ERROR] Track conversion failed {input_path}: {track_err}")
+                    continue
+
+        elif content_type == "track":
+            try:
+                download_dir = f"downloads/{release_id}"
+                filename = os.listdir(download_dir)[0]
+                filepath = os.path.join(download_dir, filename)
+                converted_filepath = f"{filepath}.{format_choice}"
+
+                if format_choice == "flac":
+                    subprocess.run(["ffmpeg", "-y", "-i", filepath, converted_filepath])
+                elif format_choice == "mp3":
+                    subprocess.run(["ffmpeg", "-y", "-i", filepath, "-b:a", "320k", converted_filepath])
+
+                audio = File(converted_filepath, easy=True)
+                artist = audio.get("artist", ["Unknown Artist"])[0]
+                title = audio.get("title", ["Unknown Title"])[0]
+                for field in ["artist", "title", "album", "genre"]:
                     if field in audio:
                         audio[field] = [value.replace(";", ", ") for value in audio[field]]
                 audio.save()
-                final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
-                final_path = os.path.join(os.path.dirname(input_path), final_name)
-                os.rename(output_path, final_path)
-                await safe_send_file(event.chat_id, final_path)
-
-            shutil.rmtree(root_path)
-            increment_download(event.chat_id, content_type)
-            del state[event.chat_id]
-
-        elif content_type == "track":
-            download_dir = f'downloads/{components[-1]}'
-            filename = os.listdir(download_dir)[0]
-            filepath = f'{download_dir}/{filename}'
-            converted_filepath = f'{download_dir}/{filename}.{format_choice}'
-
-            if format_choice == 'flac':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
-            elif format_choice == 'mp3':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k', converted_filepath])
-
-            audio = File(converted_filepath, easy=True)
-            artist = audio.get('artist', ['Unknown Artist'])[0]
-            title = audio.get('title', ['Unknown Title'])[0]
-            for field in ['artist', 'title', 'album', 'genre']:
-                if field in audio:
-                    audio[field] = [value.replace(";", ", ") for value in audio[field]]
-            audio.save()
-            new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
-            new_filepath = f'{download_dir}/{new_filename}'
-            os.rename(converted_filepath, new_filepath)
-            await safe_send_file(event.chat_id, new_filepath)
-            shutil.rmtree(download_dir)
-            increment_download(event.chat_id, content_type)
-            del state[event.chat_id]
+                new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
+                new_filepath = os.path.join(download_dir, new_filename)
+                os.rename(converted_filepath, new_filepath)
+                await safe_send_file(event.chat_id, new_filepath)
+            except Exception as track_err:
+                print(f"[ERROR] Single track conversion failed {release_id}: {track_err}")
 
     except Exception as e:
-        await event.reply(f"An error occurred during conversion: {e}")
+        print(f"[FATAL] Error in {content_type} {release_id}: {e}")
 
+    finally:
+        try:
+            if os.path.exists(root_path):
+                shutil.rmtree(root_path, ignore_errors=True)
+        except:
+            pass
+        increment_download(event.chat_id, content_type)
+        state.pop(event.chat_id, None)
 
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
