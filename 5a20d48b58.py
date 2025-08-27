@@ -150,7 +150,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 await event.reply("Download folder not found, something went wrong.")
                 return
 
-            # Use subfolder as actual title if exists (for playlists/charts)
+            # Use subfolder as actual title if exists
             subfolders = [f.path for f in os.scandir(root_path) if f.is_dir()]
             main_folder = subfolders[0] if subfolders else root_path
             title_name = os.path.basename(main_folder) if content_type in ["playlist", "chart"] else None
@@ -164,7 +164,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 await event.reply("No FLAC files found in download.")
                 return
 
-            # Metadata aggregation for playlist/chart
+            # Metadata aggregation for caption
             all_artists = "Various Artists" if content_type in ["playlist", "chart"] else set()
             genres, labels, dates, bpms = set(), set(), [], []
 
@@ -198,16 +198,20 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
 
             genre_str = ", ".join(sorted(genres)) if genres else "Unknown Genre"
             label_str = ", ".join(sorted(labels)) if labels else "--"
-            date_str = f"{min(dates).strftime('%Y-%m-%d')} - {max(dates).strftime('%Y-%m-%d')}" if dates else "--"
-            bpm_str = f"{int(min(bpms))}-{int(max(bpms))}" if bpms else "--"
+            if dates:
+                date_str = f"{min(dates).strftime('%Y-%m-%d')} - {max(dates).strftime('%Y-%m-%d')}" if len(dates) > 1 else dates[0].strftime('%Y-%m-%d')
+            else:
+                date_str = "--"
+            if bpms:
+                bpm_str = f"{int(min(bpms))}-{int(max(bpms))}" if len(bpms) > 1 else str(int(bpms[0]))
+            else:
+                bpm_str = "--"
 
-            # Album title
             if content_type == "album":
                 sample_file = flac_files[0]
                 metadata = File(sample_file, easy=True) or {}
                 title_name = metadata.get('album', ['Unknown Album'])[0]
 
-            # Send caption
             caption = (
                 f"<b>\U0001F3B6 {content_type.capitalize()}:</b> {title_name}\n"
                 f"<b>\U0001F464 Artists:</b> {artists_str}\n"
@@ -216,30 +220,35 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 f"<b>\U0001F4C5 Release Date:</b> {date_str}\n"
                 f"<b>\U0001F9E9 BPM:</b> {bpm_str}\n"
             )
-            await event.reply(caption, parse_mode='html')
 
-            # Update metadata and send FLAC files
+            # Send cover if present
+            cover_file = None
+            for root, _, files in os.walk(main_folder):
+                for f in files:
+                    if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        cover_file = os.path.join(root, f)
+                        break
+            if cover_file:
+                await client.send_file(event.chat_id, cover_file, caption=caption, parse_mode='html')
+            else:
+                await event.reply(caption, parse_mode='html')
+
+            # Update metadata and rename FLAC files
             for input_path in flac_files:
                 audio = File(input_path, easy=True)
                 if audio:
-                    performing_artists = []
-                    for key in ('artist', 'performer'):
-                        if key in audio:
-                            performing_artists.extend(audio[key])
-                    performing_artists = sorted(set(performing_artists))
-                    if performing_artists:
-                        audio['albumartist'] = performing_artists
+                    # Add all performing artists to both artist and albumartist
+                    audio['artist'] = [artists_str]
+                    audio['albumartist'] = [artists_str]
                     audio.save()
 
-                    # Rename file as "Artist1, Artist2 - TrackTitle.flac"
-                    track_title = audio.get('title', ['Unknown Title'])[0]
-                    artist_str = ", ".join(performing_artists) if performing_artists else "Unknown Artist"
-                    ext = os.path.splitext(input_path)[1]
-                    final_name = f"{artist_str} - {track_title}{ext}".replace(";", ", ")
-                    final_path = os.path.join(os.path.dirname(input_path), final_name)
-                    os.rename(input_path, final_path)
+                # Rename file: Artist1, Artist2 - Title.flac
+                title = audio.get('title', ['Unknown Title'])[0] if audio else 'Unknown Title'
+                final_name = f"{artists_str} - {title}.flac"
+                final_path = os.path.join(os.path.dirname(input_path), final_name)
+                os.rename(input_path, final_path)
 
-                    await client.send_file(event.chat_id, final_path)
+                await client.send_file(event.chat_id, final_path)
 
             shutil.rmtree(root_path)
             increment_download(event.chat_id, content_type)
@@ -252,30 +261,25 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
 
             audio = File(filepath, easy=True)
             if audio:
-                performing_artists = []
-                for key in ('artist', 'performer'):
-                    if key in audio:
-                        performing_artists.extend(audio[key])
-                performing_artists = sorted(set(performing_artists))
-                if performing_artists:
-                    audio['albumartist'] = performing_artists
+                artists = audio.get('artist', ['Unknown Artist'])
+                artists_str = ", ".join(artists)
+                audio['artist'] = [artists_str]
+                audio['albumartist'] = [artists_str]
                 audio.save()
 
-                track_title = audio.get('title', ['Unknown Title'])[0]
-                artist_str = ", ".join(performing_artists) if performing_artists else "Unknown Artist"
-                ext = os.path.splitext(filepath)[1]
-                final_name = f"{artist_str} - {track_title}{ext}".replace(";", ", ")
-                final_path = f'{download_dir}/{final_name}'
-                os.rename(filepath, final_path)
+            title = audio.get('title', ['Unknown Title'])[0] if audio else 'Unknown Title'
+            final_name = f"{artists_str} - {title}.flac"
+            final_path = os.path.join(download_dir, final_name)
+            os.rename(filepath, final_path)
 
-                await client.send_file(event.chat_id, final_path)
-
+            await client.send_file(event.chat_id, final_path)
             shutil.rmtree(download_dir)
             increment_download(event.chat_id, content_type)
             del state[event.chat_id]
 
     except Exception as e:
-        pass  # silently ignore errors
+        # Do NOT send error to Telegram
+        print(f"Conversion error for {input_text}: {e}")
 
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
