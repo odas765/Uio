@@ -138,7 +138,7 @@ async def process_queue():
 async def handle_conversion_and_sending(event, format_choice, input_text, content_type):  
     try:  
         from urllib.parse import urlparse  
-        import os, subprocess, shutil  
+        import os, subprocess, shutil, base64  
         from mutagen import File  
         from datetime import datetime  
   
@@ -256,7 +256,6 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                     os.rename(output_path, final_path)  
                     await client.send_file(event.chat_id, final_path)  
   
-                # WAV conversion (send as document)  
                 elif format_choice == 'wav':  
                     subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])  
                     original_audio = File(input_path, easy=True)  
@@ -267,21 +266,18 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                     final_path = os.path.join(os.path.dirname(input_path), final_name)  
                     os.rename(output_path, final_path)  
                     await client.send_file(event.chat_id, final_path, force_document=True)  
-
-                # AIFF conversion  
+  
                 elif format_choice == 'aiff':  
                     import mutagen  
                     from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TKEY, TXXX, TCON, COMM  
+                    from mutagen.flac import Picture  
   
-                    # Convert FLAC -> AIFF  
                     output_path = f"{input_path}.aiff"  
                     subprocess.run(['ffmpeg', '-y', '-i', input_path, output_path])  
   
-                    # Read original FLAC metadata  
                     original_audio = File(input_path)  
                     flac_tags = original_audio.tags or {}  
   
-                    # Build final AIFF filename  
                     track_id = os.path.basename(os.path.dirname(input_path))  
                     title = flac_tags.get("title", ["Unknown_Title"])[0]  
                     safe_title = title.replace(" ", "_").replace("/", "_")  
@@ -289,7 +285,17 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                     final_path = os.path.join(os.path.dirname(input_path), final_name)  
                     os.rename(output_path, final_path)  
   
-                    # Open AIFF for tagging (AIFF uses ID3)  
+                    # Extract cover.jpg  
+                    cover_path = os.path.join(os.path.dirname(input_path), "cover.jpg")  
+                    if "metadata_block_picture" in flac_tags:  
+                        try:  
+                            pic_data = base64.b64decode(flac_tags["metadata_block_picture"][0])  
+                            picture = Picture(pic_data)  
+                            with open(cover_path, "wb") as img:  
+                                img.write(picture.data)  
+                        except Exception as e:  
+                            print(f"Cover extraction failed: {e}")  
+  
                     audio = mutagen.aiff.AIFF(final_path)  
                     if audio.tags is None:  
                         audio.add_tags()  
@@ -307,10 +313,10 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                     if "bpm" in flac_tags: id3.add(TXXX(encoding=3, desc="bpm", text=flac_tags["bpm"][0]))  
                     if "comment" in flac_tags:  
                         id3.add(COMM(encoding=3, desc="Comment", text=flac_tags["comment"][0]))  
-                    if "metadata_block_picture" in flac_tags:  
-                        import base64  
-                        pic_data = base64.b64decode(flac_tags["metadata_block_picture"][0])  
-                        id3.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=pic_data))  
+  
+                    if os.path.exists(cover_path):  
+                        with open(cover_path, "rb") as img:  
+                            id3.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=img.read()))  
   
                     audio.save()  
                     await client.send_file(event.chat_id, final_path, force_document=True)  
@@ -353,7 +359,6 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 os.rename(converted_filepath, new_filepath)  
                 await client.send_file(event.chat_id, new_filepath)  
   
-            # WAV conversion (send as document)  
             elif format_choice == 'wav':  
                 subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])  
                 original_audio = File(filepath, easy=True)  
@@ -364,11 +369,11 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 new_filepath = os.path.join(download_dir, new_filename)  
                 os.rename(converted_filepath, new_filepath)  
                 await client.send_file(event.chat_id, new_filepath, force_document=True)  
-
-            # AIFF conversion (track mode)  
+  
             elif format_choice == 'aiff':  
                 import mutagen  
                 from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TKEY, TXXX, TCON, COMM  
+                from mutagen.flac import Picture  
   
                 output_path = f"{filepath}.aiff"  
                 subprocess.run(['ffmpeg', '-y', '-i', filepath, output_path])  
@@ -382,6 +387,17 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 new_filename = f"{track_id}_{safe_title}.aiff"  
                 new_filepath = os.path.join(download_dir, new_filename)  
                 os.rename(output_path, new_filepath)  
+  
+                # Extract cover.jpg  
+                cover_path = os.path.join(download_dir, "cover.jpg")  
+                if "metadata_block_picture" in flac_tags:  
+                    try:  
+                        pic_data = base64.b64decode(flac_tags["metadata_block_picture"][0])  
+                        picture = Picture(pic_data)  
+                        with open(cover_path, "wb") as img:  
+                            img.write(picture.data)  
+                    except Exception as e:  
+                        print(f"Cover extraction failed: {e}")  
   
                 audio = mutagen.aiff.AIFF(new_filepath)  
                 if audio.tags is None:  
@@ -400,10 +416,10 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 if "bpm" in flac_tags: id3.add(TXXX(encoding=3, desc="bpm", text=flac_tags["bpm"][0]))  
                 if "comment" in flac_tags:  
                     id3.add(COMM(encoding=3, desc="Comment", text=flac_tags["comment"][0]))  
-                if "metadata_block_picture" in flac_tags:  
-                    import base64  
-                    pic_data = base64.b64decode(flac_tags["metadata_block_picture"][0])  
-                    id3.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=pic_data))  
+  
+                if os.path.exists(cover_path):  
+                    with open(cover_path, "rb") as img:  
+                        id3.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=img.read()))  
   
                 audio.save()  
                 await client.send_file(event.chat_id, new_filepath, force_document=True)  
