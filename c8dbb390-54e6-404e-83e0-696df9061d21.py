@@ -135,196 +135,285 @@ async def process_queue():
 
     orpheus_running = False
 
-async def handle_conversion_and_sending(event, format_choice, input_text, content_type):
-    try:
-        from urllib.parse import urlparse
-        import os, subprocess, shutil
-        from mutagen import File
-        from datetime import datetime
+async def handle_conversion_and_sending(event, format_choice, input_text, content_type):  
+    try:  
+        from urllib.parse import urlparse  
+        import os, subprocess, shutil  
+        from mutagen import File  
+        from datetime import datetime  
+  
+        url = urlparse(input_text)  
+        components = url.path.split('/')  
+        release_id = components[-1]  
+  
+        # Handle ALBUM, TRACK, PLAYLIST, CHART  
+        if content_type in ["album", "playlist", "chart"]:  
+            root_path = f'downloads/{release_id}'  
+            if not os.path.exists(root_path):  
+                await event.reply("Download folder not found, something went wrong.")  
+                return  
+  
+            subfolders = [f.path for f in os.scandir(root_path) if f.is_dir()]  
+            main_folder = subfolders[0] if subfolders else root_path  
+            title_name = os.path.basename(main_folder) if content_type in ["playlist", "chart"] else None  
+  
+            # Collect all FLAC files  
+            flac_files = []  
+            for root, _, files in os.walk(main_folder):  
+                flac_files.extend([os.path.join(root, f) for f in files if f.lower().endswith('.flac')])  
+  
+            if not flac_files:  
+                await event.reply("No FLAC files found in download.")  
+                return  
+  
+            # Metadata aggregation  
+            all_artists = "Various Artists" if content_type in ["playlist", "chart"] else set()  
+            genres, labels, dates, bpms = set(), set(), [], []  
+  
+            for f in flac_files:  
+                audio = File(f, easy=True)  
+                if audio:  
+                    if content_type not in ["playlist", "chart"]:  
+                        for key in ('artist', 'performer', 'albumartist'):  
+                            if key in audio:  
+                                all_artists.update(audio[key])  
+                    if 'genre' in audio: genres.update(audio['genre'])  
+                    if 'label' in audio: labels.update(audio['label'])  
+                    if 'date' in audio:  
+                        try:  
+                            d = datetime.strptime(audio['date'][0], '%Y-%m-%d')  
+                            dates.append(d)  
+                        except: pass  
+                    if 'bpm' in audio:  
+                        try: bpms.append(float(audio['bpm'][0]))  
+                        except: pass  
+  
+            if content_type not in ["playlist", "chart"]:  
+                artists_str = ", ".join(sorted(all_artists)) or "Various Artists"  
+            else:  
+                artists_str = "Various Artists"  
+  
+            genre_str = ", ".join(sorted(genres)) if genres else "Unknown Genre"  
+            label_str = ", ".join(sorted(labels)) if labels else "--"  
+            date_str = f"{min(dates).strftime('%Y-%m-%d')} - {max(dates).strftime('%Y-%m-%d')}" if len(dates) > 1 else dates[0].strftime('%Y-%m-%d') if dates else "--"  
+            bpm_str = f"{int(min(bpms))}-{int(max(bpms))}" if len(bpms) > 1 else str(int(bpms[0])) if bpms else "--"  
+  
+            if content_type == "album":  
+                sample_file = flac_files[0]  
+                metadata = File(sample_file, easy=True) or {}  
+                title_name = metadata.get('album', ['Unknown Album'])[0]  
+  
+            caption = (  
+                f"<b>\U0001F3B6 {content_type.capitalize()}:</b> {title_name}\n"  
+                f"<b>\U0001F464 Artists:</b> {artists_str}\n"  
+                f"<b>\U0001F3A7 Genre:</b> {genre_str}\n"  
+                f"<b>\U0001F4BF Label:</b> {label_str}\n"  
+                f"<b>\U0001F4C5 Release Date:</b> {date_str}\n"  
+                f"<b>\U0001F9E9 BPM:</b> {bpm_str}\n"  
+            )  
+  
+            # Send cover if exists  
+            cover_file = None  
+            for root, _, files in os.walk(main_folder):  
+                for f in files:  
+                    if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png')):  
+                        cover_file = os.path.join(root, f)  
+                        break  
+            if cover_file:  
+                await client.send_file(event.chat_id, cover_file, caption=caption, parse_mode='html')  
+            else:  
+                await event.reply(caption, parse_mode='html')  
+  
+            # Convert & send tracks  
+            for input_path in flac_files:  
+                output_path = f"{input_path}.{format_choice}"  
+  
+                if format_choice == 'flac':  
+                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])  
+                    audio = File(output_path, easy=True)  
+                    artist = audio.get('artist', ['Unknown Artist'])[0]  
+                    title = audio.get('title', ['Unknown Title'])[0]  
+                    for field in ['artist', 'title', 'album', 'genre']:  
+                        if field in audio:  
+                            audio[field] = [value.replace(";", ", ") for value in audio[field]]  
+                    audio.save()  
+                    final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")  
+                    final_path = os.path.join(os.path.dirname(input_path), final_name)  
+                    os.rename(output_path, final_path)  
+                    await client.send_file(event.chat_id, final_path)  
+  
+                elif format_choice == 'mp3':  
+                    subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])  
+                    audio = File(output_path, easy=True)  
+                    artist = audio.get('artist', ['Unknown Artist'])[0]  
+                    title = audio.get('title', ['Unknown Title'])[0]  
+                    for field in ['artist', 'title', 'album', 'genre']:  
+                        if field in audio:  
+                            audio[field] = [value.replace(";", ", ") for value in audio[field]]  
+                    audio.save()  
+                    final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")  
+                    final_path = os.path.join(os.path.dirname(input_path), final_name)  
+                    os.rename(output_path, final_path)  
+                    await client.send_file(event.chat_id, final_path)  
+  
+                # WAV conversion (send as document)  
+                elif format_choice == 'wav':  
+                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])  
+                    original_audio = File(input_path, easy=True)  
+                    artists = original_audio.get('artist', ['Unknown Artist'])  
+                    clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])  
+                    track_title = original_audio.get('title', ['Unknown Title'])[0]  
+                    final_name = f"{clean_artists} - {track_title}.wav"  
+                    final_path = os.path.join(os.path.dirname(input_path), final_name)  
+                    os.rename(output_path, final_path)  
+                    await client.send_file(event.chat_id, final_path, force_document=True)  
 
-        url = urlparse(input_text)
-        components = url.path.split('/')
-        release_id = components[-1]
+                # AIFF conversion  
+                elif format_choice == 'aiff':  
+                    import mutagen  
+                    from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TKEY, TXXX, TCON, COMM  
+  
+                    # Convert FLAC -> AIFF  
+                    output_path = f"{input_path}.aiff"  
+                    subprocess.run(['ffmpeg', '-y', '-i', input_path, output_path])  
+  
+                    # Read original FLAC metadata  
+                    original_audio = File(input_path)  
+                    flac_tags = original_audio.tags or {}  
+  
+                    # Build final AIFF filename  
+                    track_id = os.path.basename(os.path.dirname(input_path))  
+                    title = flac_tags.get("title", ["Unknown_Title"])[0]  
+                    safe_title = title.replace(" ", "_").replace("/", "_")  
+                    final_name = f"{track_id}_{safe_title}.aiff"  
+                    final_path = os.path.join(os.path.dirname(input_path), final_name)  
+                    os.rename(output_path, final_path)  
+  
+                    # Open AIFF for tagging (AIFF uses ID3)  
+                    audio = mutagen.aiff.AIFF(final_path)  
+                    if audio.tags is None:  
+                        audio.add_tags()  
+                    id3 = audio.tags  
+  
+                    if "title" in flac_tags: id3.add(TIT2(encoding=3, text=flac_tags["title"][0]))  
+                    if "artist" in flac_tags: id3.add(TPE1(encoding=3, text=flac_tags["artist"][0]))  
+                    if "album" in flac_tags: id3.add(TALB(encoding=3, text=flac_tags["album"][0]))  
+                    if "date" in flac_tags: id3.add(TDRC(encoding=3, text=flac_tags["date"][0]))  
+                    if "initial_key" in flac_tags: id3.add(TKEY(encoding=3, text=flac_tags["initial_key"][0]))  
+                    if "genre" in flac_tags: id3.add(TCON(encoding=3, text=flac_tags["genre"][0]))  
+                    if "encoded_by" in flac_tags: id3.add(TXXX(encoding=3, desc="encodedby", text=flac_tags["encoded_by"][0]))  
+                    if "organization" in flac_tags: id3.add(TXXX(encoding=3, desc="grouping", text=flac_tags["organization"][0]))  
+                    if "date" in flac_tags: id3.add(TXXX(encoding=3, desc="originaldate", text=flac_tags["date"][0]))  
+                    if "bpm" in flac_tags: id3.add(TXXX(encoding=3, desc="bpm", text=flac_tags["bpm"][0]))  
+                    if "comment" in flac_tags:  
+                        id3.add(COMM(encoding=3, desc="Comment", text=flac_tags["comment"][0]))  
+                    if "metadata_block_picture" in flac_tags:  
+                        import base64  
+                        pic_data = base64.b64decode(flac_tags["metadata_block_picture"][0])  
+                        id3.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=pic_data))  
+  
+                    audio.save()  
+                    await client.send_file(event.chat_id, final_path, force_document=True)  
+  
+            shutil.rmtree(root_path)  
+            increment_download(event.chat_id, content_type)  
+            del state[event.chat_id]  
+  
+        elif content_type == "track":  
+            download_dir = f'downloads/{components[-1]}'  
+            filename = os.listdir(download_dir)[0]  
+            filepath = f'{download_dir}/{filename}'  
+            converted_filepath = f'{download_dir}/{filename}.{format_choice}'  
+  
+            if format_choice == 'flac':  
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])  
+                audio = File(converted_filepath, easy=True)  
+                artist = audio.get('artist', ['Unknown Artist'])[0]  
+                title = audio.get('title', ['Unknown Title'])[0]  
+                for field in ['artist', 'title', 'album', 'genre']:  
+                    if field in audio:  
+                        audio[field] = [value.replace(";", ", ") for value in audio[field]]  
+                audio.save()  
+                new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")  
+                new_filepath = f'{download_dir}/{new_filename}'  
+                os.rename(converted_filepath, new_filepath)  
+                await client.send_file(event.chat_id, new_filepath)  
+  
+            elif format_choice == 'mp3':  
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k', converted_filepath])  
+                audio = File(converted_filepath, easy=True)  
+                artist = audio.get('artist', ['Unknown Artist'])[0]  
+                title = audio.get('title', ['Unknown Title'])[0]  
+                for field in ['artist', 'title', 'album', 'genre']:  
+                    if field in audio:  
+                        audio[field] = [value.replace(";", ", ") for value in audio[field]]  
+                audio.save()  
+                new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")  
+                new_filepath = f'{download_dir}/{new_filename}'  
+                os.rename(converted_filepath, new_filepath)  
+                await client.send_file(event.chat_id, new_filepath)  
+  
+            # WAV conversion (send as document)  
+            elif format_choice == 'wav':  
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])  
+                original_audio = File(filepath, easy=True)  
+                artists = original_audio.get('artist', ['Unknown Artist'])  
+                clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])  
+                track_title = original_audio.get('title', ['Unknown Title'])[0]  
+                new_filename = f"{clean_artists} - {track_title}.wav"  
+                new_filepath = os.path.join(download_dir, new_filename)  
+                os.rename(converted_filepath, new_filepath)  
+                await client.send_file(event.chat_id, new_filepath, force_document=True)  
 
-        # Handle ALBUM, TRACK, PLAYLIST, CHART
-        if content_type in ["album", "playlist", "chart"]:
-            root_path = f'downloads/{release_id}'
-            if not os.path.exists(root_path):
-                await event.reply("Download folder not found, something went wrong.")
-                return
-
-            subfolders = [f.path for f in os.scandir(root_path) if f.is_dir()]
-            main_folder = subfolders[0] if subfolders else root_path
-            title_name = os.path.basename(main_folder) if content_type in ["playlist", "chart"] else None
-
-            # Collect all FLAC files
-            flac_files = []
-            for root, _, files in os.walk(main_folder):
-                flac_files.extend([os.path.join(root, f) for f in files if f.lower().endswith('.flac')])
-
-            if not flac_files:
-                await event.reply("No FLAC files found in download.")
-                return
-
-            # Metadata aggregation
-            all_artists = "Various Artists" if content_type in ["playlist", "chart"] else set()
-            genres, labels, dates, bpms = set(), set(), [], []
-
-            for f in flac_files:
-                audio = File(f, easy=True)
-                if audio:
-                    if content_type not in ["playlist", "chart"]:
-                        for key in ('artist', 'performer', 'albumartist'):
-                            if key in audio:
-                                all_artists.update(audio[key])
-                    if 'genre' in audio: genres.update(audio['genre'])
-                    if 'label' in audio: labels.update(audio['label'])
-                    if 'date' in audio:
-                        try:
-                            d = datetime.strptime(audio['date'][0], '%Y-%m-%d')
-                            dates.append(d)
-                        except: pass
-                    if 'bpm' in audio:
-                        try: bpms.append(float(audio['bpm'][0]))
-                        except: pass
-
-            if content_type not in ["playlist", "chart"]:
-                artists_str = ", ".join(sorted(all_artists)) or "Various Artists"
-            else:
-                artists_str = "Various Artists"
-
-            genre_str = ", ".join(sorted(genres)) if genres else "Unknown Genre"
-            label_str = ", ".join(sorted(labels)) if labels else "--"
-            date_str = f"{min(dates).strftime('%Y-%m-%d')} - {max(dates).strftime('%Y-%m-%d')}" if len(dates) > 1 else dates[0].strftime('%Y-%m-%d') if dates else "--"
-            bpm_str = f"{int(min(bpms))}-{int(max(bpms))}" if len(bpms) > 1 else str(int(bpms[0])) if bpms else "--"
-
-            if content_type == "album":
-                sample_file = flac_files[0]
-                metadata = File(sample_file, easy=True) or {}
-                title_name = metadata.get('album', ['Unknown Album'])[0]
-
-            caption = (
-                f"<b>\U0001F3B6 {content_type.capitalize()}:</b> {title_name}\n"
-                f"<b>\U0001F464 Artists:</b> {artists_str}\n"
-                f"<b>\U0001F3A7 Genre:</b> {genre_str}\n"
-                f"<b>\U0001F4BF Label:</b> {label_str}\n"
-                f"<b>\U0001F4C5 Release Date:</b> {date_str}\n"
-                f"<b>\U0001F9E9 BPM:</b> {bpm_str}\n"
-            )
-
-            # Send cover if exists
-            cover_file = None
-            for root, _, files in os.walk(main_folder):
-                for f in files:
-                    if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png')):
-                        cover_file = os.path.join(root, f)
-                        break
-            if cover_file:
-                await client.send_file(event.chat_id, cover_file, caption=caption, parse_mode='html')
-            else:
-                await event.reply(caption, parse_mode='html')
-
-            # Convert & send tracks
-            for input_path in flac_files:
-                output_path = f"{input_path}.{format_choice}"
-
-                if format_choice == 'flac':
-                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
-                    audio = File(output_path, easy=True)
-                    artist = audio.get('artist', ['Unknown Artist'])[0]
-                    title = audio.get('title', ['Unknown Title'])[0]
-                    for field in ['artist', 'title', 'album', 'genre']:
-                        if field in audio:
-                            audio[field] = [value.replace(";", ", ") for value in audio[field]]
-                    audio.save()
-                    final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
-                    final_path = os.path.join(os.path.dirname(input_path), final_name)
-                    os.rename(output_path, final_path)
-                    await client.send_file(event.chat_id, final_path)
-
-                elif format_choice == 'mp3':
-                    subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
-                    audio = File(output_path, easy=True)
-                    artist = audio.get('artist', ['Unknown Artist'])[0]
-                    title = audio.get('title', ['Unknown Title'])[0]
-                    for field in ['artist', 'title', 'album', 'genre']:
-                        if field in audio:
-                            audio[field] = [value.replace(";", ", ") for value in audio[field]]
-                    audio.save()
-                    final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
-                    final_path = os.path.join(os.path.dirname(input_path), final_name)
-                    os.rename(output_path, final_path)
-                    await client.send_file(event.chat_id, final_path)
-
-                # WAV conversion (send as document)
-                elif format_choice == 'wav':
-                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
-                    original_audio = File(input_path, easy=True)
-                    artists = original_audio.get('artist', ['Unknown Artist'])
-                    clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])
-                    track_title = original_audio.get('title', ['Unknown Title'])[0]
-                    final_name = f"{clean_artists} - {track_title}.wav"
-                    final_path = os.path.join(os.path.dirname(input_path), final_name)
-                    os.rename(output_path, final_path)
-                    await client.send_file(event.chat_id, final_path, force_document=True)
-
-            shutil.rmtree(root_path)
-            increment_download(event.chat_id, content_type)
-            del state[event.chat_id]
-
-        elif content_type == "track":
-            download_dir = f'downloads/{components[-1]}'
-            filename = os.listdir(download_dir)[0]
-            filepath = f'{download_dir}/{filename}'
-            converted_filepath = f'{download_dir}/{filename}.{format_choice}'
-
-            if format_choice == 'flac':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
-                audio = File(converted_filepath, easy=True)
-                artist = audio.get('artist', ['Unknown Artist'])[0]
-                title = audio.get('title', ['Unknown Title'])[0]
-                for field in ['artist', 'title', 'album', 'genre']:
-                    if field in audio:
-                        audio[field] = [value.replace(";", ", ") for value in audio[field]]
-                audio.save()
-                new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
-                new_filepath = f'{download_dir}/{new_filename}'
-                os.rename(converted_filepath, new_filepath)
-                await client.send_file(event.chat_id, new_filepath)
-
-            elif format_choice == 'mp3':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k', converted_filepath])
-                audio = File(converted_filepath, easy=True)
-                artist = audio.get('artist', ['Unknown Artist'])[0]
-                title = audio.get('title', ['Unknown Title'])[0]
-                for field in ['artist', 'title', 'album', 'genre']:
-                    if field in audio:
-                        audio[field] = [value.replace(";", ", ") for value in audio[field]]
-                audio.save()
-                new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
-                new_filepath = f'{download_dir}/{new_filename}'
-                os.rename(converted_filepath, new_filepath)
-                await client.send_file(event.chat_id, new_filepath)
-
-            # WAV conversion (send as document)
-            elif format_choice == 'wav':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
-                original_audio = File(filepath, easy=True)
-                artists = original_audio.get('artist', ['Unknown Artist'])
-                clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])
-                track_title = original_audio.get('title', ['Unknown Title'])[0]
-                new_filename = f"{clean_artists} - {track_title}.wav"
-                new_filepath = os.path.join(download_dir, new_filename)
-                os.rename(converted_filepath, new_filepath)
-                await client.send_file(event.chat_id, new_filepath, force_document=True)
-
-            shutil.rmtree(download_dir)
-            increment_download(event.chat_id, content_type)
-            del state[event.chat_id]
-
-    except Exception as e:
+            # AIFF conversion (track mode)  
+            elif format_choice == 'aiff':  
+                import mutagen  
+                from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TKEY, TXXX, TCON, COMM  
+  
+                output_path = f"{filepath}.aiff"  
+                subprocess.run(['ffmpeg', '-y', '-i', filepath, output_path])  
+  
+                original_audio = File(filepath)  
+                flac_tags = original_audio.tags or {}  
+  
+                track_id = components[-1]  
+                title = flac_tags.get("title", ["Unknown_Title"])[0]  
+                safe_title = title.replace(" ", "_").replace("/", "_")  
+                new_filename = f"{track_id}_{safe_title}.aiff"  
+                new_filepath = os.path.join(download_dir, new_filename)  
+                os.rename(output_path, new_filepath)  
+  
+                audio = mutagen.aiff.AIFF(new_filepath)  
+                if audio.tags is None:  
+                    audio.add_tags()  
+                id3 = audio.tags  
+  
+                if "title" in flac_tags: id3.add(TIT2(encoding=3, text=flac_tags["title"][0]))  
+                if "artist" in flac_tags: id3.add(TPE1(encoding=3, text=flac_tags["artist"][0]))  
+                if "album" in flac_tags: id3.add(TALB(encoding=3, text=flac_tags["album"][0]))  
+                if "date" in flac_tags: id3.add(TDRC(encoding=3, text=flac_tags["date"][0]))  
+                if "initial_key" in flac_tags: id3.add(TKEY(encoding=3, text=flac_tags["initial_key"][0]))  
+                if "genre" in flac_tags: id3.add(TCON(encoding=3, text=flac_tags["genre"][0]))  
+                if "encoded_by" in flac_tags: id3.add(TXXX(encoding=3, desc="encodedby", text=flac_tags["encoded_by"][0]))  
+                if "organization" in flac_tags: id3.add(TXXX(encoding=3, desc="grouping", text=flac_tags["organization"][0]))  
+                if "date" in flac_tags: id3.add(TXXX(encoding=3, desc="originaldate", text=flac_tags["date"][0]))  
+                if "bpm" in flac_tags: id3.add(TXXX(encoding=3, desc="bpm", text=flac_tags["bpm"][0]))  
+                if "comment" in flac_tags:  
+                    id3.add(COMM(encoding=3, desc="Comment", text=flac_tags["comment"][0]))  
+                if "metadata_block_picture" in flac_tags:  
+                    import base64  
+                    pic_data = base64.b64decode(flac_tags["metadata_block_picture"][0])  
+                    id3.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=pic_data))  
+  
+                audio.save()  
+                await client.send_file(event.chat_id, new_filepath, force_document=True)  
+  
+            shutil.rmtree(download_dir)  
+            increment_download(event.chat_id, content_type)  
+            del state[event.chat_id]  
+  
+    except Exception as e:  
         await event.reply(f"An error occurred during conversion: {e}")
-
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
