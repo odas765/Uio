@@ -135,10 +135,6 @@ async def process_queue():
 
     orpheus_running = False
 
-def safe_filename(name: str) -> str:
-    """Remove/replace illegal characters for safe file saving."""
-    return re.sub(r'[\/:*?"<>|]', '_', name)
-
 async def handle_conversion_and_sending(event, format_choice, input_text, content_type):
     try:
         from urllib.parse import urlparse
@@ -230,16 +226,10 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
 
             # Convert & send tracks
             for input_path in flac_files:
-                base, _ = os.path.splitext(input_path)
-                output_path = f"{base}.{format_choice}"
+                output_path = f"{input_path}.{format_choice}"
 
-                if format_choice in ['flac', 'mp3']:
-                    cmd = ['ffmpeg', '-y', '-i', input_path]
-                    if format_choice == 'mp3':
-                        cmd += ['-b:a', '320k']
-                    cmd.append(output_path)
-                    subprocess.run(cmd)
-
+                if format_choice == 'flac':
+                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
                     audio = File(output_path, easy=True)
                     artist = audio.get('artist', ['Unknown Artist'])[0]
                     title = audio.get('title', ['Unknown Title'])[0]
@@ -247,19 +237,33 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                         if field in audio:
                             audio[field] = [value.replace(";", ", ") for value in audio[field]]
                     audio.save()
-
-                    final_name = safe_filename(f"{artist} - {title}.{format_choice}")
+                    final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
                     final_path = os.path.join(os.path.dirname(input_path), final_name)
                     os.rename(output_path, final_path)
                     await client.send_file(event.chat_id, final_path)
 
+                elif format_choice == 'mp3':
+                    subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
+                    audio = File(output_path, easy=True)
+                    artist = audio.get('artist', ['Unknown Artist'])[0]
+                    title = audio.get('title', ['Unknown Title'])[0]
+                    for field in ['artist', 'title', 'album', 'genre']:
+                        if field in audio:
+                            audio[field] = [value.replace(";", ", ") for value in audio[field]]
+                    audio.save()
+                    final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
+                    final_path = os.path.join(os.path.dirname(input_path), final_name)
+                    os.rename(output_path, final_path)
+                    await client.send_file(event.chat_id, final_path)
+
+                # WAV conversion (send as document)
                 elif format_choice == 'wav':
-                    subprocess.run(['ffmpeg', '-y', '-i', input_path, output_path])
+                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
                     original_audio = File(input_path, easy=True)
                     artists = original_audio.get('artist', ['Unknown Artist'])
                     clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])
                     track_title = original_audio.get('title', ['Unknown Title'])[0]
-                    final_name = safe_filename(f"{clean_artists} - {track_title}.wav")
+                    final_name = f"{clean_artists} - {track_title}.wav"
                     final_path = os.path.join(os.path.dirname(input_path), final_name)
                     os.rename(output_path, final_path)
                     await client.send_file(event.chat_id, final_path, force_document=True)
@@ -271,17 +275,11 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
         elif content_type == "track":
             download_dir = f'downloads/{components[-1]}'
             filename = os.listdir(download_dir)[0]
-            filepath = os.path.join(download_dir, filename)
-            base, _ = os.path.splitext(filepath)
-            converted_filepath = f"{base}.{format_choice}"
+            filepath = f'{download_dir}/{filename}'
+            converted_filepath = f'{download_dir}/{filename}.{format_choice}'
 
-            if format_choice in ['flac', 'mp3']:
-                cmd = ['ffmpeg', '-y', '-i', filepath]
-                if format_choice == 'mp3':
-                    cmd += ['-b:a', '320k']
-                cmd.append(converted_filepath)
-                subprocess.run(cmd)
-
+            if format_choice == 'flac':
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
                 audio = File(converted_filepath, easy=True)
                 artist = audio.get('artist', ['Unknown Artist'])[0]
                 title = audio.get('title', ['Unknown Title'])[0]
@@ -289,19 +287,33 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                     if field in audio:
                         audio[field] = [value.replace(";", ", ") for value in audio[field]]
                 audio.save()
-
-                new_filename = safe_filename(f"{artist} - {title}.{format_choice}")
-                new_filepath = os.path.join(download_dir, new_filename)
+                new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
+                new_filepath = f'{download_dir}/{new_filename}'
                 os.rename(converted_filepath, new_filepath)
                 await client.send_file(event.chat_id, new_filepath)
 
+            elif format_choice == 'mp3':
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k', converted_filepath])
+                audio = File(converted_filepath, easy=True)
+                artist = audio.get('artist', ['Unknown Artist'])[0]
+                title = audio.get('title', ['Unknown Title'])[0]
+                for field in ['artist', 'title', 'album', 'genre']:
+                    if field in audio:
+                        audio[field] = [value.replace(";", ", ") for value in audio[field]]
+                audio.save()
+                new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
+                new_filepath = f'{download_dir}/{new_filename}'
+                os.rename(converted_filepath, new_filepath)
+                await client.send_file(event.chat_id, new_filepath)
+
+            # WAV conversion (send as document)
             elif format_choice == 'wav':
-                subprocess.run(['ffmpeg', '-y', '-i', filepath, converted_filepath])
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
                 original_audio = File(filepath, easy=True)
                 artists = original_audio.get('artist', ['Unknown Artist'])
                 clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])
                 track_title = original_audio.get('title', ['Unknown Title'])[0]
-                new_filename = safe_filename(f"{clean_artists} - {track_title}.wav")
+                new_filename = f"{clean_artists} - {track_title}.wav"
                 new_filepath = os.path.join(download_dir, new_filename)
                 os.rename(converted_filepath, new_filepath)
                 await client.send_file(event.chat_id, new_filepath, force_document=True)
