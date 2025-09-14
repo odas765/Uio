@@ -137,10 +137,10 @@ async def process_queue():
 
 async def handle_conversion_and_sending(event, format_choice, input_text, content_type):
     try:
-
-
-        def safe_filename(name: str) -> str:
-            return re.sub(r'[\/:*?"<>|]', '_', name)
+        from urllib.parse import urlparse
+        import os, subprocess, shutil
+        from mutagen import File
+        from datetime import datetime
 
         url = urlparse(input_text)
         components = url.path.split('/')
@@ -237,7 +237,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                         if field in audio:
                             audio[field] = [value.replace(";", ", ") for value in audio[field]]
                     audio.save()
-                    final_name = safe_filename(f"{artist} - {title}.{format_choice}".replace(";", ", "))
+                    final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
                     final_path = os.path.join(os.path.dirname(input_path), final_name)
                     os.rename(output_path, final_path)
                     await client.send_file(event.chat_id, final_path)
@@ -251,7 +251,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                         if field in audio:
                             audio[field] = [value.replace(";", ", ") for value in audio[field]]
                     audio.save()
-                    final_name = safe_filename(f"{artist} - {title}.{format_choice}".replace(";", ", "))
+                    final_name = f"{artist} - {title}.{format_choice}".replace(";", ", ")
                     final_path = os.path.join(os.path.dirname(input_path), final_name)
                     os.rename(output_path, final_path)
                     await client.send_file(event.chat_id, final_path)
@@ -263,7 +263,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                     artists = original_audio.get('artist', ['Unknown Artist'])
                     clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])
                     track_title = original_audio.get('title', ['Unknown Title'])[0]
-                    final_name = safe_filename(f"{clean_artists} - {track_title}.wav")
+                    final_name = f"{clean_artists} - {track_title}.wav"
                     final_path = os.path.join(os.path.dirname(input_path), final_name)
                     os.rename(output_path, final_path)
                     await client.send_file(event.chat_id, final_path, force_document=True)
@@ -287,7 +287,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                     if field in audio:
                         audio[field] = [value.replace(";", ", ") for value in audio[field]]
                 audio.save()
-                new_filename = safe_filename(f"{artist} - {title}.{format_choice}".replace(";", ", "))
+                new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
                 new_filepath = f'{download_dir}/{new_filename}'
                 os.rename(converted_filepath, new_filepath)
                 await client.send_file(event.chat_id, new_filepath)
@@ -301,7 +301,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                     if field in audio:
                         audio[field] = [value.replace(";", ", ") for value in audio[field]]
                 audio.save()
-                new_filename = safe_filename(f"{artist} - {title}.{format_choice}".replace(";", ", "))
+                new_filename = f"{artist} - {title}.{format_choice}".replace(";", ", ")
                 new_filepath = f'{download_dir}/{new_filename}'
                 os.rename(converted_filepath, new_filepath)
                 await client.send_file(event.chat_id, new_filepath)
@@ -313,7 +313,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 artists = original_audio.get('artist', ['Unknown Artist'])
                 clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])
                 track_title = original_audio.get('title', ['Unknown Title'])[0]
-                new_filename = safe_filename(f"{clean_artists} - {track_title}.wav")
+                new_filename = f"{clean_artists} - {track_title}.wav"
                 new_filepath = os.path.join(download_dir, new_filename)
                 os.rename(converted_filepath, new_filepath)
                 await client.send_file(event.chat_id, new_filepath, force_document=True)
@@ -324,6 +324,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
 
     except Exception as e:
         await event.reply(f"An error occurred during conversion: {e}")
+
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
