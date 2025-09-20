@@ -423,6 +423,7 @@ async def myaccount_handler(event):
            f"🔁 Resets every 24 hours\n")
     await event.reply(msg, parse_mode='html')
 
+
 @client.on(events.NewMessage(pattern='/download'))
 async def download_handler(event):
     try:
@@ -461,18 +462,18 @@ async def download_handler(event):
                     return
 
             # Check daily limits for free users
-if content_type in ["album", "track"] and not is_user_allowed(user_id, content_type):
-    await event.reply(
-        "🚫 **Daily Limit Reached!**\n\n"
-        "💿 Free users can download up to **2 albums** & **2 tracks** every 24 hours.\n\n"
-        "✨ Want **unlimited downloads** for 30 days?\n"
-        "👉 Support the project with just **$5** and send payment proof to @zackantdev",
-        buttons=[
-            [Button.url("💳 Pay $5", PAYMENT_URL)],
-            [Button.url("📢 Join our channel", "https://t.me/beatportdownloader")]
-        ]
-    )
-    return
+            if content_type in ["album", "track"] and not is_user_allowed(user_id, content_type):
+                await event.reply(
+                    "🚫 **Daily Limit Reached!**\n\n"
+                    "💿 Free users can download up to **2 albums** & **2 tracks** every 24 hours.\n\n"
+                    "✨ Want **unlimited downloads** for 30 days?\n"
+                    "👉 Support the project with just **$5** and send payment proof to @zackantdev",
+                    buttons=[
+                        [Button.url("💳 Pay $5", PAYMENT_URL)],
+                        [Button.url("📢 Join our channel", "https://t.me/beatportdownloader")]
+                    ]
+                )
+                return
 
             # Save state and ask format
             state[event.chat_id] = {"url": input_text, "type": content_type}
@@ -487,9 +488,7 @@ if content_type in ["album", "track"] and not is_user_allowed(user_id, content_t
             await event.reply('Invalid link.\nPlease send a valid Beatport track, album, playlist, or chart URL.')
     except Exception as e:
         await event.reply(f"An error occurred: {e}")
-
-
-
+            
 @client.on(events.CallbackQuery)
 async def callback_query_handler(event):
     try:
