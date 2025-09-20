@@ -460,13 +460,16 @@ async def download_handler(event):
                     return
 
             # Check daily limits for free users
-            if content_type in ["album", "track"] and not is_user_allowed(user_id, content_type):
-                await event.reply(
-                    "🚫 You've reached today's free download limit (2 albums / 2 tracks).\n"
-                    "To unlock unlimited downloads for 30 days, please support with a $5 payment and send the proof to @zackantdev",
-                    buttons=[Button.url("💳 Pay $5", PAYMENT_URL)]
-                )
-                return
+if content_type in ["album", "track"] and not is_user_allowed(user_id, content_type):
+    await event.reply(
+        "🚫 You've reached today's free download limit (2 albums / 2 tracks).\n"
+        "To unlock unlimited downloads for 30 days, please support with a $5 payment and send the proof to @zackantdev",
+        buttons=[
+            [Button.url("💳 Pay $5", PAYMENT_URL)],
+            [Button.url("📢 Join our channel", "https://t.me/beatportdownloader")]
+        ]
+    )
+    return
 
             # Save state and ask format
             state[event.chat_id] = {"url": input_text, "type": content_type}
