@@ -344,13 +344,14 @@ async def start_handler(event):
         "🚀 Paste a Beatport link now and let’s get those bangers!"
     )
     buttons = [
-        [Button.url("💟 Support", PAYMENT_URL), Button.url("📨 Contact", "https://t.me/zackantdev")]
+        [Button.url("💟 Support", PAYMENT_URL), Button.url("📨 Contact", "https://t.me/zackantdev")],
+        [Button.url("📢 Join our channel", "https://t.me/beatportdownloader")]
     ]
     if os.path.exists(banner_path):
         await client.send_file(event.chat_id, banner_path, caption=caption, buttons=buttons)
     else:
         await event.reply(caption, buttons=buttons)
-
+        
 @client.on(events.NewMessage(pattern='/add'))
 async def add_user_handler(event):
     if event.sender_id not in ADMIN_IDS:
@@ -601,6 +602,14 @@ async def total_users_handler(event):
     users = load_users()
     total = len(users)
     await event.reply(f"👥 Total registered users: <b>{total}</b>", parse_mode='html')
+
+@client.on(events.NewMessage(pattern='/updates'))
+async def updates_handler(event):
+    caption = (
+        "📢 Stay tuned for the latest bot updates, fixes, and new features!\n\n"
+        "👉 Join our official channel for updates: @beatportdownloader"
+    )
+    await event.reply(caption)
 
 @client.on(events.NewMessage(pattern='/alert'))
 async def alert_expiry_handler(event):
