@@ -604,6 +604,68 @@ async def total_users_handler(event):
     total = len(users)
     await event.reply(f"👥 Total registered users: <b>{total}</b>", parse_mode='html')
 
+@client.on(events.NewMessage)
+async def auto_download_handler(event):
+    try:
+        text = event.raw_text.strip()
+
+        # Check if it's a Beatport link (track, album, playlist, chart)
+        if (re.match(beatport_track_pattern, text) or
+            re.match(beatport_album_pattern, text) or
+            re.match(beatport_playlist_pattern, text) or
+            re.match(beatport_chart_pattern, text)):
+
+            # Just call the same logic as /download
+            user_id = event.chat_id
+            input_text = text
+
+            is_track = re.match(beatport_track_pattern, input_text)
+            is_album = re.match(beatport_album_pattern, input_text)
+            is_playlist = re.match(beatport_playlist_pattern, input_text)
+            is_chart = re.match(beatport_chart_pattern, input_text)
+
+            if is_album:
+                content_type = "album"
+            elif is_track:
+                content_type = "track"
+            elif is_playlist:
+                content_type = "playlist"
+            elif is_chart:
+                content_type = "chart"
+
+            # 🔹 The same checks from /download (limits, premium, etc.)
+            if content_type in ["playlist", "chart"]:
+                users = load_users()
+                user = users.get(str(user_id), {})
+                reset_if_needed(user)
+                expiry = user.get("expiry")
+                if not expiry or datetime.strptime(expiry, "%Y-%m-%d") <= datetime.utcnow():
+                    await event.reply(
+                        "🚫 Playlist and chart downloads are available only for premium users.",
+                        buttons=[Button.url("💳 Pay $5", PAYMENT_URL)]
+                    )
+                    return
+
+            if content_type in ["album", "track"] and not is_user_allowed(user_id, content_type):
+                await event.reply(
+                    "🚫 **Daily Limit Reached!**\n\n"
+                    "Free users can download up to **2 albums** & **2 tracks** every 24 hours.",
+                    buttons=[Button.url("💳 Pay $5", PAYMENT_URL)]
+                )
+                return
+
+            # Save state and ask format
+            state[event.chat_id] = {"url": input_text, "type": content_type}
+            await event.reply(
+                "Please choose the format:",
+                buttons=[
+                    [Button.inline("MP3 (320 kbps)", b"mp3"), Button.inline("FLAC (16 Bit)", b"flac")],
+                    [Button.inline("WAV (Lossless)", b"wav")]
+                ]
+            )
+    except Exception as e:
+        print(f"Error in auto_download_handler: {e}")
+
 @client.on(events.NewMessage(pattern='/updates'))
 async def updates_handler(event):
     caption = (
