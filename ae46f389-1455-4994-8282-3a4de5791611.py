@@ -144,6 +144,8 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
         import os, subprocess, shutil, tempfile
         from mutagen import File
         from mutagen.flac import FLAC
+        from mutagen.aiff import AIFF
+        from mutagen.id3 import APIC
         from datetime import datetime
 
         url = urlparse(input_text)
@@ -261,31 +263,35 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                     await client.send_file(event.chat_id, final_path)
 
                 elif format_choice in ['wav', 'aiff']:
-                    # Extract cover from FLAC if exists
-                    cover_file = None
+                    ext = 'wav' if format_choice == 'wav' else 'aiff'
+                    # Convert audio
+                    subprocess.run(['ffmpeg', '-y', '-i', input_path, output_path])
+
+                    # If AIFF, embed cover from original FLAC
                     if format_choice == 'aiff':
                         flac_audio = FLAC(input_path)
+                        aiff_file = AIFF(output_path)
+                        # Copy metadata
+                        audio_easy = File(input_path, easy=True)
+                        for tag in ['artist', 'title', 'album', 'genre', 'date']:
+                            if tag in audio_easy:
+                                aiff_file[tag] = audio_easy[tag]
+                        # Embed cover
                         if flac_audio.pictures:
                             pic = flac_audio.pictures[0]
-                            temp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-                            temp.write(pic.data)
-                            temp.close()
-                            cover_file = temp.name
-
-                    cmd = ['ffmpeg', '-y', '-i', input_path]
-                    if cover_file:
-                        cmd.extend(['-i', cover_file, '-map', '0:a', '-map', '1', '-c', 'copy'])
-                    cmd.append(output_path)
-                    subprocess.run(cmd)
-
-                    if cover_file:
-                        os.remove(cover_file)
+                            aiff_file.tags.add(APIC(
+                                encoding=3,
+                                mime='image/jpeg',
+                                type=3,  # Cover (front)
+                                desc='Cover',
+                                data=pic.data
+                            ))
+                        aiff_file.save()
 
                     original_audio = File(input_path, easy=True)
                     artists = original_audio.get('artist', ['Unknown Artist'])
                     clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])
                     track_title = original_audio.get('title', ['Unknown Title'])[0]
-                    ext = 'wav' if format_choice == 'wav' else 'aiff'
                     final_name = safe_filename(f"{clean_artists} - {track_title}.{ext}")
                     final_path = os.path.join(os.path.dirname(input_path), final_name)
                     os.rename(output_path, final_path)
@@ -301,38 +307,37 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
             filepath = f'{download_dir}/{filename}'
             converted_filepath = f'{download_dir}/{filename}.{format_choice}'
 
-            if format_choice in ['flac', 'mp3', 'wav', 'aiff']:
-                # AIFF specific cover extraction
-                cover_file = None
-                if format_choice == 'aiff':
-                    flac_audio = FLAC(filepath)
-                    if flac_audio.pictures:
-                        pic = flac_audio.pictures[0]
-                        temp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-                        temp.write(pic.data)
-                        temp.close()
-                        cover_file = temp.name
+            ext = format_choice
+            # Convert audio
+            subprocess.run(['ffmpeg', '-y', '-i', filepath, converted_filepath])
 
-                cmd = ['ffmpeg', '-y', '-i', filepath]
-                if format_choice == 'mp3':
-                    cmd.extend(['-b:a', '320k'])
-                if cover_file:
-                    cmd.extend(['-i', cover_file, '-map', '0:a', '-map', '1', '-c', 'copy'])
-                cmd.append(converted_filepath)
-                subprocess.run(cmd)
+            # AIFF: embed cover
+            if format_choice == 'aiff':
+                flac_audio = FLAC(filepath)
+                aiff_file = AIFF(converted_filepath)
+                audio_easy = File(filepath, easy=True)
+                for tag in ['artist', 'title', 'album', 'genre', 'date']:
+                    if tag in audio_easy:
+                        aiff_file[tag] = audio_easy[tag]
+                if flac_audio.pictures:
+                    pic = flac_audio.pictures[0]
+                    aiff_file.tags.add(APIC(
+                        encoding=3,
+                        mime='image/jpeg',
+                        type=3,
+                        desc='Cover',
+                        data=pic.data
+                    ))
+                aiff_file.save()
 
-                if cover_file:
-                    os.remove(cover_file)
-
-                original_audio = File(filepath, easy=True)
-                artists = original_audio.get('artist', ['Unknown Artist'])
-                clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])
-                track_title = original_audio.get('title', ['Unknown Title'])[0]
-                ext = format_choice
-                new_filename = safe_filename(f"{clean_artists} - {track_title}.{ext}")
-                new_filepath = os.path.join(download_dir, new_filename)
-                os.rename(converted_filepath, new_filepath)
-                await client.send_file(event.chat_id, new_filepath, force_document=(format_choice in ['wav','aiff']))
+            original_audio = File(filepath, easy=True)
+            artists = original_audio.get('artist', ['Unknown Artist'])
+            clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])
+            track_title = original_audio.get('title', ['Unknown Title'])[0]
+            final_name = safe_filename(f"{clean_artists} - {track_title}.{ext}")
+            final_path = os.path.join(download_dir, final_name)
+            os.rename(converted_filepath, final_path)
+            await client.send_file(event.chat_id, final_path, force_document=(format_choice in ['wav','aiff']))
 
             shutil.rmtree(download_dir)
             increment_download(event.chat_id, content_type)
@@ -340,6 +345,8 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
 
     except Exception as e:
         await event.reply(f"An error occurred during conversion: {e}")
+
+
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
