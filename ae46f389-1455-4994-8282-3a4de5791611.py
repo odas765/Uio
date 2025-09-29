@@ -448,7 +448,6 @@ async def myaccount_handler(event):
            f"🔁 Resets every 24 hours\n")
     await event.reply(msg, parse_mode='html')
 
-
 @client.on(events.NewMessage(pattern='/download'))
 async def download_handler(event):
     try:
@@ -506,14 +505,14 @@ async def download_handler(event):
                 "Please choose the format:",
                 buttons=[
                     [Button.inline("MP3 (320 kbps)", b"mp3"), Button.inline("FLAC (16 Bit)", b"flac")],
-                    [Button.inline("WAV (Lossless)", b"wav")]
+                    [Button.inline("WAV (Lossless)", b"wav"), Button.inline("AIFF (Lossless)", b"aiff")]
                 ]
             )
         else:
             await event.reply('Invalid link.\nPlease send a valid Beatport track, album, playlist, or chart URL.')
     except Exception as e:
         await event.reply(f"An error occurred: {e}")
-            
+
 @client.on(events.CallbackQuery)
 async def callback_query_handler(event):
     try:
