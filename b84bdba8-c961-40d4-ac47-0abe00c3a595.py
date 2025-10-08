@@ -141,9 +141,24 @@ async def process_queue():
 async def handle_conversion_and_sending(event, format_choice, input_text, content_type):
     try:
         from urllib.parse import urlparse
-        import os, subprocess, shutil
+        import os, subprocess, shutil, requests
         from mutagen import File
         from datetime import datetime
+
+        def upload_to_gofile(file_path):
+            try:
+                server_response = requests.get("https://api.gofile.io/getServer").json()
+                server = server_response["data"]["server"]
+                with open(file_path, "rb") as f:
+                    response = requests.post(f"https://{server}.gofile.io/uploadFile", files={"file": f})
+                if response.status_code == 200:
+                    data = response.json()
+                    if data["status"] == "ok":
+                        return data["data"]["downloadPage"]
+                return None
+            except Exception as e:
+                print("Upload failed:", e)
+                return None
 
         url = urlparse(input_text)
         components = url.path.split('/')
@@ -214,62 +229,26 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 f"<b>\U0001F4C5 Release Date:</b> {date_str}\n"
                 f"<b>\U0001F9E9 BPM:</b> {bpm_str}\n"
             )
+            await event.reply(caption, parse_mode='html')
 
-            # Send cover if exists
-            cover_file = None
-            for root, _, files in os.walk(main_folder):
-                for f in files:
-                    if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png')):
-                        cover_file = os.path.join(root, f)
-                        break
-            if cover_file:
-                await client.send_file(event.chat_id, cover_file, caption=caption, parse_mode='html')
-            else:
-                await event.reply(caption, parse_mode='html')
-
-            # Convert & send tracks
+            # Convert & upload tracks to Gofile
             for input_path in flac_files:
                 output_path = f"{input_path}.{format_choice}"
+                subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k' if format_choice == 'mp3' else '1411k', output_path])
 
-                if format_choice == 'flac':
-                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
-                    audio = File(output_path, easy=True)
-                    artist = audio.get('artist', ['Unknown Artist'])[0]
-                    title = audio.get('title', ['Unknown Title'])[0]
-                    for field in ['artist', 'title', 'album', 'genre']:
-                        if field in audio:
-                            audio[field] = [value.replace(";", ", ") for value in audio[field]]
-                    audio.save()
-                    final_name = safe_filename(f"{artist} - {title}.{format_choice}".replace(";", ", "))
-                    final_path = os.path.join(os.path.dirname(input_path), final_name)
-                    os.rename(output_path, final_path)
-                    await client.send_file(event.chat_id, final_path)
+                audio = File(output_path, easy=True)
+                artist = audio.get('artist', ['Unknown Artist'])[0]
+                title = audio.get('title', ['Unknown Title'])[0]
+                final_name = f"{artist} - {title}.{format_choice}"
+                final_path = os.path.join(os.path.dirname(input_path), final_name)
+                os.rename(output_path, final_path)
 
-                elif format_choice == 'mp3':
-                    subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
-                    audio = File(output_path, easy=True)
-                    artist = audio.get('artist', ['Unknown Artist'])[0]
-                    title = audio.get('title', ['Unknown Title'])[0]
-                    for field in ['artist', 'title', 'album', 'genre']:
-                        if field in audio:
-                            audio[field] = [value.replace(";", ", ") for value in audio[field]]
-                    audio.save()
-                    final_name = safe_filename(f"{artist} - {title}.{format_choice}".replace(";", ", "))
-                    final_path = os.path.join(os.path.dirname(input_path), final_name)
-                    os.rename(output_path, final_path)
-                    await client.send_file(event.chat_id, final_path)
-
-                # WAV conversion (send as document)
-                elif format_choice == 'wav':
-                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
-                    original_audio = File(input_path, easy=True)
-                    artists = original_audio.get('artist', ['Unknown Artist'])
-                    clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])
-                    track_title = original_audio.get('title', ['Unknown Title'])[0]
-                    final_name = safe_filename(f"{clean_artists} - {track_title}.wav")
-                    final_path = os.path.join(os.path.dirname(input_path), final_name)
-                    os.rename(output_path, final_path)
-                    await client.send_file(event.chat_id, final_path, force_document=True)
+                link = upload_to_gofile(final_path)
+                if link:
+                    await event.reply(f"✅ <b>{final_name}</b>\n🔗 [Download Link]({link})", parse_mode='html', link_preview=False)
+                    os.remove(final_path)
+                else:
+                    await event.reply(f"❌ Upload failed for {final_name}")
 
             shutil.rmtree(root_path)
             increment_download(event.chat_id, content_type)
@@ -281,45 +260,20 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
             filepath = f'{download_dir}/{filename}'
             converted_filepath = f'{download_dir}/{filename}.{format_choice}'
 
-            if format_choice == 'flac':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
-                audio = File(converted_filepath, easy=True)
-                artist = audio.get('artist', ['Unknown Artist'])[0]
-                title = audio.get('title', ['Unknown Title'])[0]
-                for field in ['artist', 'title', 'album', 'genre']:
-                    if field in audio:
-                        audio[field] = [value.replace(";", ", ") for value in audio[field]]
-                audio.save()
-                new_filename = safe_filename(f"{artist} - {title}.{format_choice}".replace(";", ", "))
-                new_filepath = f'{download_dir}/{new_filename}'
-                os.rename(converted_filepath, new_filepath)
-                await client.send_file(event.chat_id, new_filepath)
+            subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k' if format_choice == 'mp3' else '1411k', converted_filepath])
+            audio = File(converted_filepath, easy=True)
+            artist = audio.get('artist', ['Unknown Artist'])[0]
+            title = audio.get('title', ['Unknown Title'])[0]
+            new_filename = f"{artist} - {title}.{format_choice}"
+            new_filepath = f'{download_dir}/{new_filename}'
+            os.rename(converted_filepath, new_filepath)
 
-            elif format_choice == 'mp3':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k', converted_filepath])
-                audio = File(converted_filepath, easy=True)
-                artist = audio.get('artist', ['Unknown Artist'])[0]
-                title = audio.get('title', ['Unknown Title'])[0]
-                for field in ['artist', 'title', 'album', 'genre']:
-                    if field in audio:
-                        audio[field] = [value.replace(";", ", ") for value in audio[field]]
-                audio.save()
-                new_filename = safe_filename(f"{artist} - {title}.{format_choice}".replace(";", ", "))
-                new_filepath = f'{download_dir}/{new_filename}'
-                os.rename(converted_filepath, new_filepath)
-                await client.send_file(event.chat_id, new_filepath)
-
-            # WAV conversion (send as document)
-            elif format_choice == 'wav':
-                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
-                original_audio = File(filepath, easy=True)
-                artists = original_audio.get('artist', ['Unknown Artist'])
-                clean_artists = ", ".join([a.strip() for a in ";".join(artists).split(";")])
-                track_title = original_audio.get('title', ['Unknown Title'])[0]
-                new_filename = safe_filename(f"{clean_artists} - {track_title}.wav")
-                new_filepath = os.path.join(download_dir, new_filename)
-                os.rename(converted_filepath, new_filepath)
-                await client.send_file(event.chat_id, new_filepath, force_document=True)
+            link = upload_to_gofile(new_filepath)
+            if link:
+                await event.reply(f"✅ <b>{new_filename}</b>\n🔗 [Download Link]({link})", parse_mode='html', link_preview=False)
+                os.remove(new_filepath)
+            else:
+                await event.reply(f"❌ Upload failed for {new_filename}")
 
             shutil.rmtree(download_dir)
             increment_download(event.chat_id, content_type)
@@ -327,7 +281,6 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
 
     except Exception as e:
         await event.reply(f"An error occurred during conversion: {e}")
-
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
