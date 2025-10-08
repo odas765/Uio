@@ -138,17 +138,42 @@ async def process_queue():
 
     orpheus_running = False
 
-import requests
+
+
+GOFILE_UPLOAD_URL = "https://upload.gofile.io/uploadFile"  # anonymous upload
+
+
+def create_anonymous_folder():
+    """Creates a new anonymous folder and returns its folder code."""
+    try:
+        # Get server for anonymous uploads
+        response = requests.post("https://api.gofile.io/getServer")
+        response.raise_for_status()
+        server = response.json()["data"]["server"]
+        # Initial upload to create folder (small placeholder file)
+        files = {"file": ("placeholder.txt", b"placeholder")}
+        r = requests.post(f"https://{server}.gofile.io/uploadFile", files=files, timeout=60)
+        r.raise_for_status()
+        folder_code = r.json()["data"]["folderCode"]
+        return folder_code
+    except Exception as e:
+        print("Error creating anonymous folder:", e)
+        return None
+
 
 def upload_to_gofile_anonymous(file_path, folder_code=None):
-    url = "https://upload.gofile.io/uploadfile"
+    """
+    Upload a file anonymously to GoFile.
+    If folder_code is provided, uploads into that folder.
+    Returns the upload data dict (includes 'directLink' and 'folderCode') or None if failed.
+    """
     try:
         with open(file_path, "rb") as f:
             files = {"file": f}
             params = {}
             if folder_code:
                 params["folderId"] = folder_code
-            response = requests.post(url, files=files, params=params, timeout=600)
+            response = requests.post(GOFILE_UPLOAD_URL, files=files, params=params, timeout=600)
             response.raise_for_status()
             result = response.json()
             if result.get("status") in ("ok", "success"):
@@ -163,11 +188,6 @@ def upload_to_gofile_anonymous(file_path, folder_code=None):
 
 async def handle_conversion_and_sending(event, format_choice, input_text, content_type):
     try:
-        from urllib.parse import urlparse
-        import os, subprocess, shutil
-        from mutagen import File
-        from datetime import datetime
-
         url = urlparse(input_text)
         components = url.path.split('/')
         release_id = components[-1]
@@ -187,6 +207,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
             flac_files = []
             for root, _, files in os.walk(main_folder):
                 flac_files.extend([os.path.join(root, f) for f in files if f.lower().endswith('.flac')])
+
             if not flac_files:
                 await event.reply("No FLAC files found in download.")
                 return
@@ -237,48 +258,49 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 f"<b>\U0001F9E9 BPM:</b> {bpm_str}\n"
             )
 
-            # Upload cover if exists
+            # Locate cover file
             cover_file = None
             for root, _, files in os.walk(main_folder):
                 for f in files:
                     if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png')):
                         cover_file = os.path.join(root, f)
                         break
-
             if cover_file:
-                await event.reply(f"{caption}\n\nCover will be uploaded with tracks.", parse_mode='html')
-            else:
-                await event.reply(caption, parse_mode='html')
+                caption += f"\nCover included"
 
-            # Convert all tracks and prepare upload list
+            await event.reply(caption, parse_mode='html')
+
+            # Convert all tracks and save in temp folder
             temp_folder = f"{main_folder}_converted"
             os.makedirs(temp_folder, exist_ok=True)
             converted_files = []
 
             for input_path in flac_files:
-                output_path = os.path.join(temp_folder, f"{os.path.splitext(os.path.basename(input_path))[0]}.{format_choice}")
-                if format_choice == 'flac' or format_choice == 'wav':
-                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
-                elif format_choice == 'mp3':
-                    subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
-                converted_files.append(output_path)
+                filename = os.path.basename(input_path)
+                output_file = os.path.join(temp_folder, f"{os.path.splitext(filename)[0]}.{format_choice}")
+                cmd = ['ffmpeg', '-n', '-i', input_path]
+                if format_choice == 'mp3':
+                    cmd += ['-b:a', '320k']
+                cmd.append(output_file)
+                subprocess.run(cmd)
+                converted_files.append(output_file)
 
+            # Add cover file to upload list if exists
             if cover_file:
                 converted_files.append(cover_file)
 
-            # Upload all converted files to single anonymous folder
-            folder_code = None
-            for i, file_path in enumerate(converted_files):
-                data = upload_to_gofile_anonymous(file_path, folder_code=folder_code)
-                if not data:
-                    await event.reply(f"GoFile upload failed for file: {os.path.basename(file_path)}")
-                    continue
-                if i == 0:
-                    folder_code = data['folderCode']
+            # Create anonymous folder and upload all files
+            folder_code = create_anonymous_folder()
+            if not folder_code:
+                await event.reply("Failed to create anonymous GoFile folder.")
+                return
 
-            if folder_code:
-                folder_link = f"https://gofile.io/d/{folder_code}"
-                await event.reply(f"All tracks + cover uploaded to GoFile folder: {folder_link}")
+            for file_path in converted_files:
+                upload_to_gofile_anonymous(file_path, folder_code=folder_code)
+
+            # Send folder link
+            folder_link = f"https://gofile.io/d/{folder_code}"
+            await event.reply(f"All tracks + cover uploaded to GoFile folder: {folder_link}")
 
             # Cleanup
             shutil.rmtree(root_path)
@@ -286,7 +308,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
             increment_download(event.chat_id, content_type)
             del state[event.chat_id]
 
-        # TRACK handling remains unchanged
+        # TRACK handling (unchanged)
         elif content_type == "track":
             download_dir = f'downloads/{components[-1]}'
             filename = os.listdir(download_dir)[0]
@@ -318,6 +340,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
 
     except Exception as e:
         await event.reply(f"An error occurred during conversion: {e}")
+
 
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
