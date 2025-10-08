@@ -138,33 +138,43 @@ async def process_queue():
 
     orpheus_running = False
 
+import os
+import subprocess
+import shutil
+from mutagen import File
+from datetime import datetime
+import requests
+
 async def handle_conversion_and_sending(event, format_choice, input_text, content_type):
     try:
         from urllib.parse import urlparse
-        import os, subprocess, shutil, requests
-        from mutagen import File
-        from datetime import datetime
 
-        def upload_to_gofile(file_path):
+        def safe_filename(name):
+            # Simple safe filename function
+            return "".join(c for c in name if c.isalnum() or c in " .-_").rstrip()
+
+        def upload_to_gofile_anonymous(file_path):
+            url = "https://upload.gofile.io/uploadfile"
             try:
-                server_response = requests.get("https://api.gofile.io/getServer").json()
-                server = server_response["data"]["server"]
                 with open(file_path, "rb") as f:
-                    response = requests.post(f"https://{server}.gofile.io/uploadFile", files={"file": f})
-                if response.status_code == 200:
-                    data = response.json()
-                    if data["status"] == "ok":
-                        return data["data"]["downloadPage"]
-                return None
+                    files = {"file": f}
+                    response = requests.post(url, files=files, timeout=600)
+                    response.raise_for_status()
+                    result = response.json()
+                    if result.get("status") in ("ok", "success"):
+                        return result["data"]["directLink"]
+                    else:
+                        print("GoFile upload failed:", result)
+                        return None
             except Exception as e:
-                print("Upload failed:", e)
+                print("GoFile upload error:", e)
                 return None
 
         url = urlparse(input_text)
         components = url.path.split('/')
         release_id = components[-1]
 
-        # Handle ALBUM, TRACK, PLAYLIST, CHART
+        # Determine download folder
         if content_type in ["album", "playlist", "chart"]:
             root_path = f'downloads/{release_id}'
             if not os.path.exists(root_path):
@@ -175,7 +185,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
             main_folder = subfolders[0] if subfolders else root_path
             title_name = os.path.basename(main_folder) if content_type in ["playlist", "chart"] else None
 
-            # Collect all FLAC files
+            # Collect FLAC files
             flac_files = []
             for root, _, files in os.walk(main_folder):
                 flac_files.extend([os.path.join(root, f) for f in files if f.lower().endswith('.flac')])
@@ -206,11 +216,7 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                         try: bpms.append(float(audio['bpm'][0]))
                         except: pass
 
-            if content_type not in ["playlist", "chart"]:
-                artists_str = ", ".join(sorted(all_artists)) or "Various Artists"
-            else:
-                artists_str = "Various Artists"
-
+            artists_str = ", ".join(sorted(all_artists)) if content_type not in ["playlist", "chart"] else "Various Artists"
             genre_str = ", ".join(sorted(genres)) if genres else "Unknown Genre"
             label_str = ", ".join(sorted(labels)) if labels else "--"
             date_str = f"{min(dates).strftime('%Y-%m-%d')} - {max(dates).strftime('%Y-%m-%d')}" if len(dates) > 1 else dates[0].strftime('%Y-%m-%d') if dates else "--"
@@ -229,26 +235,40 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
                 f"<b>\U0001F4C5 Release Date:</b> {date_str}\n"
                 f"<b>\U0001F9E9 BPM:</b> {bpm_str}\n"
             )
+
             await event.reply(caption, parse_mode='html')
 
-            # Convert & upload tracks to Gofile
+            # Convert & upload tracks
             for input_path in flac_files:
                 output_path = f"{input_path}.{format_choice}"
-                subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k' if format_choice == 'mp3' else '1411k', output_path])
+
+                if format_choice == 'flac':
+                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
+                elif format_choice == 'mp3':
+                    subprocess.run(['ffmpeg', '-n', '-i', input_path, '-b:a', '320k', output_path])
+                else:  # WAV or AIFF
+                    subprocess.run(['ffmpeg', '-n', '-i', input_path, output_path])
 
                 audio = File(output_path, easy=True)
-                artist = audio.get('artist', ['Unknown Artist'])[0]
-                title = audio.get('title', ['Unknown Title'])[0]
-                final_name = f"{artist} - {title}.{format_choice}"
+                if audio:
+                    for field in ['artist', 'title', 'album', 'genre']:
+                        if field in audio:
+                            audio[field] = [value.replace(";", ", ") for value in audio[field]]
+                    audio.save()
+
+                # Rename with metadata
+                track_artist = audio.get('artist', ['Unknown Artist'])[0] if audio else "Unknown Artist"
+                track_title = audio.get('title', ['Unknown Title'])[0] if audio else os.path.basename(input_path)
+                final_name = safe_filename(f"{track_artist} - {track_title}.{format_choice}")
                 final_path = os.path.join(os.path.dirname(input_path), final_name)
                 os.rename(output_path, final_path)
 
-                link = upload_to_gofile(final_path)
+                # Upload to GoFile
+                link = upload_to_gofile_anonymous(final_path)
                 if link:
-                    await event.reply(f"✅ <b>{final_name}</b>\n🔗 [Download Link]({link})", parse_mode='html', link_preview=False)
-                    os.remove(final_path)
+                    await event.reply(f"🎵 {track_title} uploaded: {link}")
                 else:
-                    await event.reply(f"❌ Upload failed for {final_name}")
+                    await event.reply(f"❌ Failed to upload {track_title}")
 
             shutil.rmtree(root_path)
             increment_download(event.chat_id, content_type)
@@ -260,20 +280,32 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
             filepath = f'{download_dir}/{filename}'
             converted_filepath = f'{download_dir}/{filename}.{format_choice}'
 
-            subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k' if format_choice == 'mp3' else '1411k', converted_filepath])
-            audio = File(converted_filepath, easy=True)
-            artist = audio.get('artist', ['Unknown Artist'])[0]
-            title = audio.get('title', ['Unknown Title'])[0]
-            new_filename = f"{artist} - {title}.{format_choice}"
-            new_filepath = f'{download_dir}/{new_filename}'
-            os.rename(converted_filepath, new_filepath)
-
-            link = upload_to_gofile(new_filepath)
-            if link:
-                await event.reply(f"✅ <b>{new_filename}</b>\n🔗 [Download Link]({link})", parse_mode='html', link_preview=False)
-                os.remove(new_filepath)
+            if format_choice == 'flac':
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
+            elif format_choice == 'mp3':
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, '-b:a', '320k', converted_filepath])
             else:
-                await event.reply(f"❌ Upload failed for {new_filename}")
+                subprocess.run(['ffmpeg', '-n', '-i', filepath, converted_filepath])
+
+            audio = File(converted_filepath, easy=True)
+            if audio:
+                for field in ['artist', 'title', 'album', 'genre']:
+                    if field in audio:
+                        audio[field] = [value.replace(";", ", ") for value in audio[field]]
+                audio.save()
+
+            track_artist = audio.get('artist', ['Unknown Artist'])[0] if audio else "Unknown Artist"
+            track_title = audio.get('title', ['Unknown Title'])[0] if audio else os.path.basename(filepath)
+            final_name = safe_filename(f"{track_artist} - {track_title}.{format_choice}")
+            final_path = os.path.join(download_dir, final_name)
+            os.rename(converted_filepath, final_path)
+
+            # Upload to GoFile
+            link = upload_to_gofile_anonymous(final_path)
+            if link:
+                await event.reply(f"🎵 {track_title} uploaded: {link}")
+            else:
+                await event.reply(f"❌ Failed to upload {track_title}")
 
             shutil.rmtree(download_dir)
             increment_download(event.chat_id, content_type)
@@ -281,6 +313,9 @@ async def handle_conversion_and_sending(event, format_choice, input_text, conten
 
     except Exception as e:
         await event.reply(f"An error occurred during conversion: {e}")
+
+
+
 # === START HANDLER WITH IMAGE & BUTTONS ===
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
