@@ -7,8 +7,8 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from telethon import TelegramClient, events, Button
 from mutagen import File
-
 import asyncio
+import requests
 
 # Orpheus sequential queue
 orpheus_queue = asyncio.Queue()
@@ -17,7 +17,6 @@ orpheus_running = False
 api_id = '10074048'
 api_hash = 'a08b1ed3365fa3b04bcf2bcbf71aff4d'
 session_name = 'beatport_downloader'
-
 
 beatport_track_pattern    = r'^https:\/\/www\.beatport\.com(?:\/[a-z]{2})?\/track\/[\w\-]+\/\d+(?:\?.*)?$'
 beatport_album_pattern    = r'^https:\/\/www\.beatport\.com(?:\/[a-z]{2})?\/release\/[\w\-]+\/\d+(?:\?.*)?$'
@@ -85,7 +84,8 @@ def whitelist_user(user_id):
         "expiry": (datetime.utcnow() + timedelta(days=30)).strftime('%Y-%m-%d'),
         "album_today": 0,
         "track_today": 0,
-        "last_reset": datetime.utcnow().strftime('%Y-%m-%d')
+        "last_reset": datetime.utcnow().strftime('%Y-%m-%d'),
+        "upload_method": "gofile"  # default
     }
     save_users(users)
 
@@ -99,14 +99,12 @@ def remove_user(user_id):
 
 client = TelegramClient(session_name, api_id, api_hash)
 
-
 async def run_orpheus(user_id, url):
     global orpheus_running
     future = asyncio.get_event_loop().create_future()
     await orpheus_queue.put((user_id, url, future))
     await process_queue()
     await future
-
 
 async def process_queue():
     global orpheus_running
@@ -138,8 +136,6 @@ async def process_queue():
 
     orpheus_running = False
 
-import requests
-
 def upload_to_gofile_anonymous(file_path):
     url = "https://upload.gofile.io/uploadfile"
     try:
@@ -149,7 +145,6 @@ def upload_to_gofile_anonymous(file_path):
             response.raise_for_status()
             result = response.json()
             if result.get("status") in ("ok", "success"):
-                # Use 'link' or fallback to 'downloadPage'
                 return result["data"].get("link") or result["data"].get("downloadPage")
             else:
                 print("GoFile upload failed:", result)
@@ -157,6 +152,21 @@ def upload_to_gofile_anonymous(file_path):
     except Exception as e:
         print("GoFile upload error:", e)
         return None
+
+async def send_file(event, file_path):
+    users = load_users()
+    user = users.get(str(event.chat_id), {})
+    method = user.get("upload_method", "gofile")
+    if method == "telegram":
+        await event.reply(file=file_path)
+    else:
+        link = upload_to_gofile_anonymous(file_path)
+        if link:
+            await event.reply(f"{os.path.basename(file_path)}: {link}")
+
+# The handle_conversion_and_sending function remains almost the same
+# Replace all calls to upload_to_gofile_anonymous(...) in it with await send_file(event, final_path)
+# And for cover: await send_file(event, cover_file)
 
 
 async def handle_conversion_and_sending(event, format_choice, input_text, content_type):
@@ -499,11 +509,30 @@ async def download_handler(event):
             await event.reply('Invalid link.\nPlease send a valid Beatport track, album, playlist, or chart URL.')
     except Exception as e:
         await event.reply(f"An error occurred: {e}")
-            
+
 @client.on(events.CallbackQuery)
 async def callback_query_handler(event):
     try:
-        format_choice = event.data.decode('utf-8')
+        data = event.data.decode('utf-8')
+        users = load_users()
+        uid = str(event.chat_id)
+        if uid not in users:
+            users[uid] = {}
+
+        # 🔹 Upload method selection
+        if data == "upload_telegram":
+            users[uid]["upload_method"] = "telegram"
+            save_users(users)
+            await event.edit("Upload method set to Telegram.")
+            return
+        elif data == "upload_gofile":
+            users[uid]["upload_method"] = "gofile"
+            save_users(users)
+            await event.edit("Upload method set to GoFile.")
+            return
+
+        # 🔹 Format selection (mp3/flac/wav)
+        format_choice = data
         url_info = state.get(event.chat_id)
         if not url_info:
             await event.edit("No URL found. Please start again using /download.")
@@ -521,6 +550,21 @@ async def callback_query_handler(event):
 
     except Exception as e:
         await event.reply(f"An error occurred during processing: {e}")
+
+@client.on(events.NewMessage(pattern=r'/settings'))
+async def settings_handler(event):
+    users = load_users()
+    uid = str(event.chat_id)
+    if uid not in users:
+        users[uid] = {"upload_method": "gofile"}
+    user = users[uid]
+
+    current_method = user.get("upload_method", "gofile")
+    buttons = [
+        [Button.inline("Telegram Upload", b"upload_telegram"), Button.inline("GoFile Upload", b"upload_gofile")],
+    ]
+
+    await event.reply(f"Current upload method: {current_method}", buttons=buttons)
 
 
 @client.on(events.NewMessage(pattern='/broadcast'))
