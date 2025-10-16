@@ -196,6 +196,6 @@ async def sort_album_from_artist(album_data: dict):
 
 
 async def ffmpeg_convert(input_file):
-    cmd = f'ffmpeg -i "{input_file}" -c:a copy -loglevel error -y "{input_file}.flac"'
+    cmd = f'ffmpeg -i "{input_file}" -c:a libmp3lame -b:a 320k -loglevel error -y "{input_file}.mp3"'
     task = await asyncio.create_subprocess_shell(cmd)
     await task.wait()
