@@ -1,698 +1,286 @@
+#!/usr/bin/env python3
+"""
+tg_to_youtube_bot.py
+
+Usage:
+ - Set environment variable TELEGRAM_TOKEN with your bot token.
+ - Place your Google OAuth client secrets JSON (OAuth 2.0 Client ID) as "client_secrets.json"
+   or set GOOGLE_CLIENT_SECRETS env var to the path.
+ - First time run will open a browser window (or give a URL) to authorize YouTube upload access.
+ - Then run the bot. Send a photo and an audio/voice/file to the bot; when both are present,
+   it will create a 720p MP4 and upload it to your YouTube account.
+
+Note: You must enable YouTube Data API v3 in Google Cloud Console for the OAuth client.
+"""
+
 import os
-import re
-import shutil
-import subprocess
-import json
-from datetime import datetime, timedelta
-from urllib.parse import urlparse
-from telethon import TelegramClient, events, Button
-from mutagen import File
-
+import logging
 import asyncio
+import tempfile
+import json
+import pathlib
+from pathlib import Path
+from typing import Optional
 
-# Orpheus sequential queue
-orpheus_queue = asyncio.Queue()
-orpheus_running = False
+# Telegram
+from telegram import Update, MessageEntity
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
-api_id = '10074048'
-api_hash = 'a08b1ed3365fa3b04bcf2bcbf71aff4d'
-session_name = 'beatport_downloader'
+# Google / YouTube
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
+# Subprocess for ffmpeg
+import subprocess
 
-beatport_track_pattern    = r'^https:\/\/www\.beatport\.com(?:\/[a-z]{2})?\/track\/[\w\-]+\/\d+(?:\?.*)?$'
-beatport_album_pattern    = r'^https:\/\/www\.beatport\.com(?:\/[a-z]{2})?\/release\/[\w\-]+\/\d+(?:\?.*)?$'
-beatport_playlist_pattern = r'^https:\/\/www\.beatport\.com(?:\/[a-z]{2})?\/(library\/playlists|playlists\/share)\/\d+(?:\?.*)?$'
-beatport_chart_pattern    = r'^https:\/\/www\.beatport\.com(?:\/[a-z]{2})?\/chart\/[\w\-]+\/\d+(?:\?.*)?$'
+# ---------- Configuration ----------
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+GOOGLE_CLIENT_SECRETS = os.environ.get("GOOGLE_CLIENT_SECRETS", "client_secrets.json")
+CREDENTIALS_PATH = os.environ.get("GOOGLE_CREDENTIALS", "youtube_credentials.json")
 
-state = {}
-ADMIN_IDS = [616584208, 731116951, 769363217]
-PAYMENT_URL = "https://ko-fi.com/zackant"
-USERS_FILE = 'users.json'
+# YouTube scopes needed for upload + manage
+YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube"]
 
-def safe_filename(name: str) -> str:
-    return re.sub(r'[\/:*?"<>|]', '_', name)
+# Directory to store per-user temp files
+BASE_DIR = Path(tempfile.gettempdir()) / "tg_to_youtube"
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-def load_users():
-    if not os.path.exists(USERS_FILE):
-        return {}
-    with open(USERS_FILE, 'r') as f:
-        return json.load(f)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def save_users(users):
-    with open(USERS_FILE, 'w') as f:
-        json.dump(users, f)
+# In-memory mapping user_id -> dict with 'image_path' and 'audio_path'
+user_assets = {}
 
-def reset_if_needed(user):
-    today_str = datetime.utcnow().strftime('%Y-%m-%d')
-    if user.get("last_reset") != today_str:
-        user["album_today"] = 0
-        user["track_today"] = 0
-        user["last_reset"] = today_str
+# ---------- Helper functions ----------
 
-def is_user_allowed(user_id, content_type):
-    if user_id in ADMIN_IDS:
-        return True
-    users = load_users()
-    user = users.get(str(user_id), {})
-    reset_if_needed(user)
-    if user.get('expiry'):
-        if datetime.strptime(user['expiry'], '%Y-%m-%d') > datetime.utcnow():
-            return True
-    if content_type == 'album' and user.get("album_today", 0) >= 2:
-        return False
-    if content_type == 'track' and user.get("track_today", 0) >= 2:
-        return False
-    return True
+def get_user_folder(user_id: int) -> Path:
+    p = BASE_DIR / str(user_id)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-def increment_download(user_id, content_type):
-    if user_id in ADMIN_IDS:
-        return
-    users = load_users()
-    uid = str(user_id)
-    if uid not in users:
-        users[uid] = {}
-    user = users[uid]
-    reset_if_needed(user)
-    if content_type == 'album':
-        user["album_today"] = user.get("album_today", 0) + 1
-    elif content_type == 'track':
-        user["track_today"] = user.get("track_today", 0) + 1
-    save_users(users)
+def creds_exist() -> bool:
+    return Path(CREDENTIALS_PATH).exists()
 
-def whitelist_user(user_id):
-    users = load_users()
-    users[str(user_id)] = {
-        "expiry": (datetime.utcnow() + timedelta(days=30)).strftime('%Y-%m-%d'),
-        "album_today": 0,
-        "track_today": 0,
-        "last_reset": datetime.utcnow().strftime('%Y-%m-%d')
-    }
-    save_users(users)
+def load_credentials() -> Optional[Credentials]:
+    if not creds_exist():
+        return None
+    with open(CREDENTIALS_PATH, "r") as f:
+        data = json.load(f)
+    return Credentials.from_authorized_user_info(data, scopes=YOUTUBE_SCOPES)
 
-def remove_user(user_id):
-    users = load_users()
-    if str(user_id) in users:
-        users.pop(str(user_id))
-        save_users(users)
-        return True
-    return False
+def save_credentials(creds: Credentials):
+    with open(CREDENTIALS_PATH, "w") as f:
+        f.write(creds.to_json())
 
-client = TelegramClient(session_name, api_id, api_hash)
-
-
-async def run_orpheus(user_id, url):
-    global orpheus_running
-    future = asyncio.get_event_loop().create_future()
-    await orpheus_queue.put((user_id, url, future))
-    await process_queue()
-    await future
-
-
-async def process_queue():
-    global orpheus_running
-    if orpheus_running:
-        return
-
-    while not orpheus_queue.empty():
-        orpheus_running = True
-        user_id, url, future = await orpheus_queue.get()
-
+def ensure_youtube_credentials():
+    """
+    Returns google.oauth2.credentials.Credentials authorized to use the YouTube Data API.
+    On first run it will perform the installed-app OAuth flow (opens a browser or prints a URL).
+    """
+    creds = load_credentials()
+    if creds and creds.valid:
+        return creds
+    if creds and creds.expired and creds.refresh_token:
         try:
-            proc = await asyncio.create_subprocess_exec(
-                'python', 'orpheus.py', url,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await proc.communicate()
-
-            if proc.returncode != 0:
-                print(f"[{user_id}] Orpheus failed: {stderr.decode()}")
-            else:
-                print(f"[{user_id}] Orpheus finished successfully")
-
+            creds.refresh(Request())
+            save_credentials(creds)
+            return creds
         except Exception as e:
-            print(f"[{user_id}] Error running Orpheus: {e}")
-        finally:
-            future.set_result(True)
-            orpheus_queue.task_done()
+            logger.warning("Failed to refresh credentials: %s", e)
 
-    orpheus_running = False
+    # Start installed app flow (this will prompt a browser / display URL).
+    flow = InstalledAppFlow.from_client_secrets_file(GOOGLE_CLIENT_SECRETS, scopes=YOUTUBE_SCOPES)
+    creds = flow.run_local_server(port=0)
+    save_credentials(creds)
+    return creds
 
-
-
-GOFILE_UPLOAD_URL = "https://upload.gofile.io/uploadFile"  # anonymous upload
-
-
-def create_anonymous_folder():
-    """Creates a new anonymous folder and returns its folder code."""
-    try:
-        # Get server for anonymous uploads
-        response = requests.post("https://api.gofile.io/getServer")
-        response.raise_for_status()
-        server = response.json()["data"]["server"]
-        # Initial upload to create folder (small placeholder file)
-        files = {"file": ("placeholder.txt", b"placeholder")}
-        r = requests.post(f"https://{server}.gofile.io/uploadFile", files=files, timeout=60)
-        r.raise_for_status()
-        folder_code = r.json()["data"]["folderCode"]
-        return folder_code
-    except Exception as e:
-        print("Error creating anonymous folder:", e)
-        return None
-
-
-def upload_to_gofile_anonymous(file_path, folder_code=None):
+def ffmpeg_create_video(image_path: Path, audio_path: Path, output_path: Path):
     """
-    Upload a file anonymously to GoFile.
-    If folder_code is provided, uploads into that folder.
-    Returns the upload data dict (includes 'directLink' and 'folderCode') or None if failed.
+    Uses ffmpeg to create a 1280x720 mp4 from a single image and an audio file.
+    Keeps aspect ratio, pads to 1280x720, uses libx264 and aac.
     """
-    try:
-        with open(file_path, "rb") as f:
-            files = {"file": f}
-            params = {}
-            if folder_code:
-                params["folderId"] = folder_code
-            response = requests.post(GOFILE_UPLOAD_URL, files=files, params=params, timeout=600)
-            response.raise_for_status()
-            result = response.json()
-            if result.get("status") in ("ok", "success"):
-                return result["data"]
-            else:
-                print("GoFile upload failed:", result)
-                return None
-    except Exception as e:
-        print("GoFile upload error:", e)
-        return None
-
-
-async def handle_conversion_and_sending(event, format_choice, input_text, content_type):
-    try:
-        url = urlparse(input_text)
-        components = url.path.split('/')
-        release_id = components[-1]
-
-        # Handle ALBUM, PLAYLIST, CHART
-        if content_type in ["album", "playlist", "chart"]:
-            root_path = f'downloads/{release_id}'
-            if not os.path.exists(root_path):
-                await event.reply("Download folder not found, something went wrong.")
-                return
-
-            subfolders = [f.path for f in os.scandir(root_path) if f.is_dir()]
-            main_folder = subfolders[0] if subfolders else root_path
-            title_name = os.path.basename(main_folder) if content_type in ["playlist", "chart"] else None
-
-            # Collect all FLAC files
-            flac_files = []
-            for root, _, files in os.walk(main_folder):
-                flac_files.extend([os.path.join(root, f) for f in files if f.lower().endswith('.flac')])
-
-            if not flac_files:
-                await event.reply("No FLAC files found in download.")
-                return
-
-            # Metadata aggregation
-            all_artists = "Various Artists" if content_type in ["playlist", "chart"] else set()
-            genres, labels, dates, bpms = set(), set(), [], []
-
-            for f in flac_files:
-                audio = File(f, easy=True)
-                if audio:
-                    if content_type not in ["playlist", "chart"]:
-                        for key in ('artist', 'performer', 'albumartist'):
-                            if key in audio:
-                                all_artists.update(audio[key])
-                    if 'genre' in audio: genres.update(audio['genre'])
-                    if 'label' in audio: labels.update(audio['label'])
-                    if 'date' in audio:
-                        try:
-                            d = datetime.strptime(audio['date'][0], '%Y-%m-%d')
-                            dates.append(d)
-                        except: pass
-                    if 'bpm' in audio:
-                        try: bpms.append(float(audio['bpm'][0]))
-                        except: pass
-
-            if content_type not in ["playlist", "chart"]:
-                artists_str = ", ".join(sorted(all_artists)) or "Various Artists"
-            else:
-                artists_str = "Various Artists"
-
-            genre_str = ", ".join(sorted(genres)) if genres else "Unknown Genre"
-            label_str = ", ".join(sorted(labels)) if labels else "--"
-            date_str = f"{min(dates).strftime('%Y-%m-%d')} - {max(dates).strftime('%Y-%m-%d')}" if len(dates) > 1 else dates[0].strftime('%Y-%m-%d') if dates else "--"
-            bpm_str = f"{int(min(bpms))}-{int(max(bpms))}" if len(bpms) > 1 else str(int(bpms[0])) if bpms else "--"
-
-            if content_type == "album":
-                sample_file = flac_files[0]
-                metadata = File(sample_file, easy=True) or {}
-                title_name = metadata.get('album', ['Unknown Album'])[0]
-
-            caption = (
-                f"<b>\U0001F3B6 {content_type.capitalize()}:</b> {title_name}\n"
-                f"<b>\U0001F464 Artists:</b> {artists_str}\n"
-                f"<b>\U0001F3A7 Genre:</b> {genre_str}\n"
-                f"<b>\U0001F4BF Label:</b> {label_str}\n"
-                f"<b>\U0001F4C5 Release Date:</b> {date_str}\n"
-                f"<b>\U0001F9E9 BPM:</b> {bpm_str}\n"
-            )
-
-            # Locate cover file
-            cover_file = None
-            for root, _, files in os.walk(main_folder):
-                for f in files:
-                    if f.lower().startswith('cover') and f.lower().endswith(('.jpg', '.jpeg', '.png')):
-                        cover_file = os.path.join(root, f)
-                        break
-            if cover_file:
-                caption += f"\nCover included"
-
-            await event.reply(caption, parse_mode='html')
-
-            # Convert all tracks and save in temp folder
-            temp_folder = f"{main_folder}_converted"
-            os.makedirs(temp_folder, exist_ok=True)
-            converted_files = []
-
-            for input_path in flac_files:
-                filename = os.path.basename(input_path)
-                output_file = os.path.join(temp_folder, f"{os.path.splitext(filename)[0]}.{format_choice}")
-                cmd = ['ffmpeg', '-n', '-i', input_path]
-                if format_choice == 'mp3':
-                    cmd += ['-b:a', '320k']
-                cmd.append(output_file)
-                subprocess.run(cmd)
-                converted_files.append(output_file)
-
-            # Add cover file to upload list if exists
-            if cover_file:
-                converted_files.append(cover_file)
-
-            # Create anonymous folder and upload all files
-            folder_code = create_anonymous_folder()
-            if not folder_code:
-                await event.reply("Failed to create anonymous GoFile folder.")
-                return
-
-            for file_path in converted_files:
-                upload_to_gofile_anonymous(file_path, folder_code=folder_code)
-
-            # Send folder link
-            folder_link = f"https://gofile.io/d/{folder_code}"
-            await event.reply(f"All tracks + cover uploaded to GoFile folder: {folder_link}")
-
-            # Cleanup
-            shutil.rmtree(root_path)
-            shutil.rmtree(temp_folder)
-            increment_download(event.chat_id, content_type)
-            del state[event.chat_id]
-
-        # TRACK handling (unchanged)
-        elif content_type == "track":
-            download_dir = f'downloads/{components[-1]}'
-            filename = os.listdir(download_dir)[0]
-            filepath = f'{download_dir}/{filename}'
-            converted_filepath = f'{download_dir}/{filename}.{format_choice}'
-
-            if format_choice in ['flac', 'mp3', 'wav']:
-                cmd = ['ffmpeg', '-n', '-i', filepath]
-                if format_choice == 'mp3': cmd += ['-b:a', '320k']
-                cmd.append(converted_filepath)
-                subprocess.run(cmd)
-                audio = File(converted_filepath, easy=True)
-                artist = audio.get('artist', ['Unknown Artist'])[0]
-                title = audio.get('title', ['Unknown Title'])[0]
-                for field in ['artist', 'title', 'album', 'genre']:
-                    if field in audio:
-                        audio[field] = [value.replace(";", ", ") for value in audio[field]]
-                audio.save()
-                new_filename = safe_filename(f"{artist} - {title}.{format_choice}".replace(";", ", "))
-                new_filepath = os.path.join(download_dir, new_filename)
-                os.rename(converted_filepath, new_filepath)
-                link = upload_to_gofile_anonymous(new_filepath)
-                if link:
-                    await event.reply(f"{artist} - {title}: {link}")
-
-            shutil.rmtree(download_dir)
-            increment_download(event.chat_id, content_type)
-            del state[event.chat_id]
-
-    except Exception as e:
-        await event.reply(f"An error occurred during conversion: {e}")
-
-
-# === START HANDLER WITH IMAGE & BUTTONS ===
-@client.on(events.NewMessage(pattern='/start'))
-async def start_handler(event):
-    banner_path = 'banner.gif'  # Your banner image/gif in working dir
-    caption = (
-        "🎧 Hey DJ! 🎶\n\n"
-        "Welcome to Beatport Downloader Bot – your assistant for downloading full Beatport tracks, albums, playlists & charts.\n\n"
-        "❓ What I Can Do:\n"
-        "🎵 Download original-quality Beatport releases\n"
-        "📁 Send you organized, tagged audio files\n\n"
-        "📋 Commands:\n"
-        "➤ /download beatport url – Start download\n"
-        "➤ /myaccount – Check daily usage\n\n"
-        "🚀 Paste a Beatport link now and let’s get those bangers!"
-    )
-    buttons = [
-        [Button.url("💟 Support", PAYMENT_URL), Button.url("📨 Contact", "https://t.me/zackantdev")],
-        [Button.url("📢 Join our channel", "https://t.me/+UsTE5Ufq1W4wOWE1")]
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loop", "1",
+        "-i", str(image_path),
+        "-i", str(audio_path),
+        "-c:v", "libx264",
+        "-tune", "stillimage",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-pix_fmt", "yuv420p",
+        "-shortest",
+        "-vf",
+        "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+        str(output_path)
     ]
-    if os.path.exists(banner_path):
-        await client.send_file(event.chat_id, banner_path, caption=caption, buttons=buttons)
-    else:
-        await event.reply(caption, buttons=buttons)
-        
-@client.on(events.NewMessage(pattern='/add'))
-async def add_user_handler(event):
-    if event.sender_id not in ADMIN_IDS:
-        await event.reply("❌ You're not authorized to perform this action.")
-        return
-    try:
-        parts = event.message.text.split()
-        if len(parts) < 2:
-            await event.reply("⚠️ Usage: /add <user_id> [days]\nExample: /add 123456789 15")
-            return
+    logger.info("Running ffmpeg: %s", " ".join(cmd))
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        logger.error("ffmpeg failed: %s", proc.stderr.decode())
+        raise RuntimeError("ffmpeg failed: " + proc.stderr.decode())
+    logger.info("Created video at %s", output_path)
+    return output_path
 
-        user_id = int(parts[1])
-        days = int(parts[2]) if len(parts) > 2 else 30
-
-        expiry_date = (datetime.utcnow() + timedelta(days=days)).strftime('%Y-%m-%d')
-
-        users = load_users()
-        users[str(user_id)] = {
-            "expiry": expiry_date,
-            "album_today": 0,
-            "track_today": 0,
-            "last_reset": datetime.utcnow().strftime('%Y-%m-%d')
+def youtube_upload_video(creds: Credentials, video_path: Path, title: str = "Uploaded from Telegram Bot", description: str = "", privacyStatus: str = "unlisted"):
+    """
+    Uploads video to YouTube. Returns the video id on success.
+    """
+    youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
+    body = {
+        "snippet": {
+            "title": title,
+            "description": description,
+            "tags": ["telegram", "upload", "bot"]
+        },
+        "status": {
+            "privacyStatus": privacyStatus
         }
-        save_users(users)
-
-        await event.reply(f"✅ User {user_id} has been granted access for {days} days (until {expiry_date}).")
-    except Exception as e:
-        await event.reply(f"⚠️ Failed to add user: {e}")
-
-@client.on(events.NewMessage(pattern='/remove'))
-async def remove_user_handler(event):
-    if event.sender_id not in ADMIN_IDS:
-        await event.reply("❌ You're not authorized to perform this action.")
-        return
+    }
+    media = MediaFileUpload(str(video_path), chunksize=-1, resumable=True, mimetype="video/*")
+    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+    response = None
+    logger.info("Starting upload to YouTube...")
     try:
-        user_id = int(event.message.text.split(maxsplit=1)[1])
-        removed = remove_user(user_id)
-        if removed:
-            await event.reply(f"✅ User {user_id} has been removed and now has daily limits.")
-        else:
-            await event.reply(f"ℹ️ User {user_id} was not found in the whitelist.")
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                logger.info("Upload progress: %.2f%%", status.progress() * 100)
     except Exception as e:
-        await event.reply(f"⚠️ Failed to remove user: {e}")
+        logger.exception("Upload failed: %s", e)
+        raise
+    logger.info("Upload finished. Video ID: %s", response.get("id"))
+    return response.get("id")
 
-@client.on(events.NewMessage(pattern='/myaccount'))
-async def myaccount_handler(event):
-    user_id = str(event.chat_id)
-    users = load_users()
-    user = users.get(user_id, {})
-    reset_if_needed(user)
+# ---------- Telegram handlers ----------
 
-    # Check for premium
-    expiry = user.get("expiry")
-    if expiry and datetime.strptime(expiry, '%Y-%m-%d') > datetime.utcnow():
-        await event.reply(
-            f"<b>🎧 Account Status: Premium</b>\n\n"
-            f"✅ Unlimited downloads until <b>{expiry}</b>\n"
-            f"💟 Thank you for supporting the project!",
-            parse_mode='html'
-        )
-        return
-
-    # Default (free user) response
-    album_left = 2 - user.get("album_today", 0)
-    track_left = 2 - user.get("track_today", 0)
-    msg = (f"<b>🎧 Daily Download Usage</b>\n\n"
-           f"📀 Albums: {album_left}/2 remaining\n"
-           f"🎵 Tracks: {track_left}/2 remaining\n"
-           f"🔁 Resets every 24 hours\n")
-    await event.reply(msg, parse_mode='html')
-
-
-@client.on(events.NewMessage(pattern='/download'))
-async def download_handler(event):
-    try:
-        user_id = event.chat_id
-        input_text = event.message.text.split(maxsplit=1)[1].strip()
-
-        # Check type of Beatport link
-        is_track = re.match(beatport_track_pattern, input_text)
-        is_album = re.match(beatport_album_pattern, input_text)
-        is_playlist = re.match(beatport_playlist_pattern, input_text)
-        is_chart = re.match(beatport_chart_pattern, input_text)
-
-        if is_track or is_album or is_playlist or is_chart:
-            # Determine content type
-            if is_album:
-                content_type = "album"
-            elif is_track:
-                content_type = "track"
-            elif is_playlist:
-                content_type = "playlist"
-            elif is_chart:
-                content_type = "chart"
-
-            # Restrict playlists/charts to whitelisted users
-            if content_type in ["playlist", "chart"]:
-                users = load_users()
-                user = users.get(str(user_id), {})
-                reset_if_needed(user)
-                expiry = user.get("expiry")
-                if not expiry or datetime.strptime(expiry, "%Y-%m-%d") <= datetime.utcnow():
-                    await event.reply(
-                        "🚫 Playlist and chart downloads are available only for premium users.\n"
-                        "Please support with a $5 payment to unlock playlist & chart downloading",
-                        buttons=[Button.url("💳 Pay $5", PAYMENT_URL)]
-                    )
-                    return
-
-            # Check daily limits for free users
-            if content_type in ["album", "track"] and not is_user_allowed(user_id, content_type):
-                await event.reply(
-                    "🚫 **Daily Limit Reached!**\n\n"
-                    "💿 Free users can download up to **2 albums** & **2 tracks** every 24 hours.\n\n"
-                    "✨ Want **unlimited downloads** for 30 days?\n"
-                    "👉 Support the project with just **$5** and send payment proof to @zackantdev",
-                    buttons=[
-                        [Button.url("💳 Pay $5", PAYMENT_URL)],
-                        
-                    ]
-                )
-                return
-
-            # Save state and ask format
-            state[event.chat_id] = {"url": input_text, "type": content_type}
-            await event.reply(
-                "Please choose the format:",
-                buttons=[
-                    [Button.inline("MP3 (320 kbps)", b"mp3"), Button.inline("FLAC (16 Bit)", b"flac")],
-                    [Button.inline("WAV (Lossless)", b"wav")]
-                ]
-            )
-        else:
-            await event.reply('Invalid link.\nPlease send a valid Beatport track, album, playlist, or chart URL.')
-    except Exception as e:
-        await event.reply(f"An error occurred: {e}")
-            
-@client.on(events.CallbackQuery)
-async def callback_query_handler(event):
-    try:
-        format_choice = event.data.decode('utf-8')
-        url_info = state.get(event.chat_id)
-        if not url_info:
-            await event.edit("No URL found. Please start again using /download.")
-            return
-
-        input_text = url_info["url"]
-        content_type = url_info["type"]
-        await event.edit(f"You selected {format_choice.upper()}. Downloading...")
-
-        # 🔹 Run Orpheus sequentially (queued)
-        await run_orpheus(event.chat_id, input_text)
-
-        # 🔹 After Orpheus finishes, start conversion independently
-        asyncio.create_task(handle_conversion_and_sending(event, format_choice, input_text, content_type))
-
-    except Exception as e:
-        await event.reply(f"An error occurred during processing: {e}")
-
-
-@client.on(events.NewMessage(pattern='/broadcast'))
-async def broadcast_handler(event):
-    if event.sender_id not in ADMIN_IDS:
-        await event.reply("❌ You're not authorized to use this command.")
-        return
-
-    try:
-        args = event.message.text.split(maxsplit=1)
-        if len(args) < 2:
-            await event.reply("⚠️ Please provide a message to broadcast. Usage:\n<b>/broadcast Your message here</b>", parse_mode='html')
-            return
-        broadcast_message = args[1]
-
-        users = load_users()
-        count = 0
-        failed = 0
-        for uid, data in users.items():
-            if int(uid) in ADMIN_IDS:
-                continue
-            if 'expiry' in data:
-                try:
-                    expiry = datetime.strptime(data['expiry'], '%Y-%m-%d')
-                    if expiry > datetime.utcnow():
-                        continue  # Skip whitelisted users
-                except:
-                    pass
-            try:
-                await client.send_message(int(uid), f"📢 <b>Announcement</b>\n\n{broadcast_message}", parse_mode='html')
-                count += 1
-            except Exception as e:
-                print(f"Failed to send to {uid}: {e}")
-                failed += 1
-
-        await event.reply(f"✅ Broadcast sent to <b>{count}</b> users.\n❌ Failed to send to <b>{failed}</b> users.", parse_mode='html')
-    except Exception as e:
-        await event.reply(f"⚠️ An error occurred while broadcasting: {e}")
-
-
-@client.on(events.NewMessage(pattern='/adminlist'))
-async def admin_list_handler(event):
-    if event.sender_id not in ADMIN_IDS:
-        await event.reply("❌ You're not authorized to use this command.")
-        return
-    lines = ["<b>👑 Admin Users:</b>\n"]
-    for admin_id in ADMIN_IDS:
-        try:
-            user = await client.get_entity(admin_id)
-            username = f"@{user.username}" if user.username else "No username"
-            lines.append(f"• <code>{admin_id}</code> – {username}")
-        except Exception:
-            lines.append(f"• <code>{admin_id}</code> – [Could not fetch username]")
-    await event.reply("\n".join(lines), parse_mode='html')
-
-
-@client.on(events.NewMessage(pattern='/whitelist'))
-async def whitelist_handler(event):
-    if event.sender_id not in ADMIN_IDS:
-        await event.reply("❌ You're not authorized to use this command.")
-        return
-    users = load_users()
-    now = datetime.utcnow()
-    lines = ["<b>📜 Whitelisted Users (Premium):</b>\n"]
-    count = 0
-    for uid, data in users.items():
-        if 'expiry' in data:
-            try:
-                expiry = datetime.strptime(data['expiry'], '%Y-%m-%d')
-                if expiry > now:
-                    try:
-                        user = await client.get_entity(int(uid))
-                        username = f"@{user.username}" if user.username else "No username"
-                    except Exception:
-                        username = "[Could not fetch username]"
-                    lines.append(f"• <code>{uid}</code> – {username} (expires: {data['expiry']})")
-                    count += 1
-            except:
-                continue
-
-    if count == 0:
-        lines.append("No active whitelisted users found.")
-    await event.reply("\n".join(lines), parse_mode='html')
-
-# === NEW COMMAND: /totalusers ===
-@client.on(events.NewMessage(pattern='/totalusers'))
-async def total_users_handler(event):
-    if event.sender_id not in ADMIN_IDS:
-        await event.reply("❌ You're not authorized to use this command.")
-        return
-    users = load_users()
-    total = len(users)
-    await event.reply(f"👥 Total registered users: <b>{total}</b>", parse_mode='html')
-
-@client.on(events.NewMessage(pattern='/updates'))
-async def updates_handler(event):
-    caption = (
-        "📢 Stay tuned for the latest bot updates, fixes, and new features!\n\n"
-        "👉 Join our official channel for updates: https://t.me/+UsTE5Ufq1W4wOWE1"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hi! Send a PHOTO and an AUDIO/VOICE/FILE (mp3/m4a/ogg) to me. "
+        "When both are received I will create a 720p video and upload to YouTube (your channel)."
     )
-    await event.reply(caption)
 
-@client.on(events.NewMessage(pattern='/alert'))
-async def alert_expiry_handler(event):
-    if event.sender_id not in ADMIN_IDS:
-        await event.reply("❌ You're not authorized to use this command.")
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bot running. Send /start to get instructions.")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user_id = msg.from_user.id
+    folder = get_user_folder(user_id)
+    photo = msg.photo[-1]  # best quality
+    path = folder / "image.jpg"
+    await photo.get_file().download(custom_path=str(path))
+    user_assets[user_id] = user_assets.get(user_id, {})
+    user_assets[user_id]["image_path"] = path
+    await msg.reply_text(f"Saved image ({path.name}). Now send the audio you want to pair with it.")
+    # attempt to produce if audio already present
+    if "audio_path" in user_assets[user_id]:
+        await process_and_upload(update, context, user_id)
+
+async def handle_audio_or_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user_id = msg.from_user.id
+    folder = get_user_folder(user_id)
+    # audio can be msg.audio, msg.voice, msg.document
+    audio_file = None
+    if msg.audio:
+        audio_file = msg.audio
+        filename = "audio." + (audio_file.file_name.split(".")[-1] if audio_file.file_name else "mp3")
+    elif msg.voice:
+        audio_file = msg.voice
+        filename = "voice.ogg"  # telegram voice is typically ogg/opus
+    elif msg.document:
+        audio_file = msg.document
+        filename = audio_file.file_name or "audiofile"
+    else:
+        await msg.reply_text("No audio-like file found in the message.")
         return
 
-    users = load_users()
-    now = datetime.utcnow().date()
-    notified = 0
-    failed = 0
+    target = folder / "audio_in"
+    await audio_file.get_file().download(custom_path=str(target))
+    # convert to mp3/aac-compatible container if necessary using ffmpeg
+    converted = folder / "audio.mp3"
+    try:
+        cmd = ["ffmpeg", "-y", "-i", str(target), "-vn", "-acodec", "mp3", str(converted)]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except Exception as e:
+        logger.warning("ffmpeg audio conversion failed: %s", e)
+        # fallback: use the original file
+        converted = target
+    user_assets[user_id] = user_assets.get(user_id, {})
+    user_assets[user_id]["audio_path"] = converted
+    await msg.reply_text(f"Saved audio ({converted.name}). Now send the image you want to pair with it.")
+    if "image_path" in user_assets[user_id]:
+        await process_and_upload(update, context, user_id)
 
-    for uid, data in users.items():
-        expiry_str = data.get('expiry')
-        if not expiry_str:
-            continue
+async def process_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """
+    Combine image and audio to create video and upload to YouTube.
+    This function runs synchronously (blocking) because ffmpeg and upload are heavy operations.
+    We run it in a threadpool to avoid blocking the event loop.
+    """
+    chat = update.effective_chat
+    msg = update.message
+    assets = user_assets.get(user_id, {})
+    image_path = assets.get("image_path")
+    audio_path = assets.get("audio_path")
+    if not image_path or not audio_path:
+        await chat.send_message("Waiting for both image and audio.")
+        return
 
-        try:
-            expiry = datetime.strptime(expiry_str, '%Y-%m-%d').date()
-            days_left = (expiry - now).days
+    # Prepare file paths
+    folder = get_user_folder(user_id)
+    output_video = folder / "out_720p.mp4"
 
-            if days_left in [1, 2, 3]:
-                if days_left == 3:
-                    message = (
-                        f"⏳ <b>Heads up!</b>\n\n"
-                        f"Your premium access will expire in <b>3 days</b> on <b>{expiry_str}</b>.\n"
-                        f"Renew early to enjoy uninterrupted downloads!, If you paid send a messege to @zackantdev"
-                    )
-                elif days_left == 2:
-                    message = (
-                        f"⏳ <b>Reminder:</b>\n\n"
-                        f"Your premium access will expire in <b>2 days</b> on <b>{expiry_str}</b>.\n"
-                        f"Don’t forget to renew and keep the music flowing!, If you paid send a messege to @zackantdev"
-                    )
-                elif days_left == 1:
-                    message = (
-                        f"⚠️ <b>Final Reminder:</b>\n\n"
-                        f"Your premium access expires <b>TOMORROW</b> (<b>{expiry_str}</b>).\n"
-                        f"Renew now to avoid losing your unlimited access, If you paid send a messege to @zackantdev"
-                    )
+    async def blocking_work():
+        # ensure credentials
+        creds = ensure_youtube_credentials()  # may open browser the first time
+        # create video
+        ffmpeg_create_video(image_path, audio_path, output_video)
+        # upload
+        title = f"Telegram upload by {user_id}"
+        description = "Uploaded via Telegram bot."
+        video_id = youtube_upload_video(creds, output_video, title=title, description=description)
+        return video_id
 
-                try:
-                    await client.send_message(
-                        int(uid),
-                        message,
-                        parse_mode='html',
-                        buttons=[
-                            [Button.url("💳 Donate Here", PAYMENT_URL)],
-                            [Button.url("📨 Contact @zackantdev", "https://t.me/zackantdev")]
-                        ]
-                    )
-                    notified += 1
-                except Exception as e:
-                    print(f"❌ Failed to message {uid}: {e}")
-                    failed += 1
-        except Exception as e:
-            print(f"⚠️ Error parsing expiry for user {uid}: {e}")
-            continue
+    # Run the blocking_work in executor
+    loop = asyncio.get_running_loop()
+    try:
+        await chat.send_message("Processing video and uploading to YouTube. This may take a few minutes...")
+        video_id = await loop.run_in_executor(None, blocking_work)
+    except Exception as e:
+        logger.exception("Failed to create/upload video: %s", e)
+        await chat.send_message(f"Failed: {e}")
+        return
 
-    await event.reply(
-        f"✅ Expiry alerts sent to <b>{notified}</b> users.\n❌ Failed for <b>{failed}</b> users.",
-        parse_mode='html'
-    )
-    
-async def main():
-    async with client:
-        print("Client is running...")
-        await client.run_until_disconnected()
+    yt_url = f"https://youtu.be/{video_id}"
+    await chat.send_message(f"Upload finished: {yt_url}")
 
-if __name__ == '__main__':
-    client.loop.run_until_complete(main())
+    # Optionally clear stored assets for the user
+    user_assets.pop(user_id, None)
+
+# ---------- Main run ----------
+
+def main():
+    token = TELEGRAM_TOKEN
+    if not token:
+        raise RuntimeError("Please set TELEGRAM_TOKEN env var to your bot token.")
+    application = ApplicationBuilder().token(token).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    # Accept audio, voice, and document (for audio files)
+    audio_filter = filters.AUDIO | filters.VOICE | (filters.Document.ALL & filters.Document.MIME_TYPE("audio/*"))
+    application.add_handler(MessageHandler(audio_filter, handle_audio_or_voice))
+
+    logger.info("Bot started. Listening for messages...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
