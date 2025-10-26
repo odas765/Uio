@@ -1,94 +1,70 @@
-import logging
-import requests
-from urllib.parse import urlparse, urlunparse
+import subprocess
+import shutil
+import uuid
+from pathlib import Path
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-import threading
-import time
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Enable logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ================= CONFIG =================
+BOT_TOKEN = "8479816021:AAGuvc_auuT4iYFn2vle0xVk-t2bswey8k8"
+BASE_DOWNLOAD_DIR = Path.home() / "Apple Music"  # Root folder for all downloads
+EXTENSIONS = [".m4a", ".mp3", ".flac", ".lrc"]  # File types to send
 
-# In-memory storage for user domains and links
-user_domains = {}
-user_links = {}
-
-# Default polling interval (seconds)
-REFRESH_INTERVAL = 30
-
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "Welcome! Send me a short link and I will replace its domain with your custom domain.\n"
-        "Use /setdomain <your_domain> to set your custom domain."
+# ================= BOT HANDLERS =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hello! Send me an Apple Music link, and I will download it and send it back automatically."
     )
 
-def set_domain(update: Update, context: CallbackContext):
-    if len(context.args) != 1:
-        update.message.reply_text("Usage: /setdomain <your_custom_domain>")
-        return
-    domain = context.args[0].rstrip('/')  # remove trailing slash
-    user_domains[update.message.chat_id] = domain
-    update.message.reply_text(f"Custom domain set to: {domain}")
-
-def replace_domain(original_url: str, new_domain: str) -> str:
-    parsed = urlparse(original_url)
-    # Replace netloc with new domain
-    parsed = parsed._replace(netloc=urlparse(new_domain).netloc, scheme=urlparse(new_domain).scheme)
-    return urlunparse(parsed)
-
-def process_link(chat_id: int, link: str, context: CallbackContext):
-    try:
-        # Follow redirect
-        response = requests.get(link, allow_redirects=True, timeout=10)
-        final_url = response.url
-
-        # Get user domain
-        domain = user_domains.get(chat_id, "https://mtc1.ctyas.com")
-        modified_url = replace_domain(final_url, domain)
-
-        context.bot.send_message(chat_id=chat_id, text=f"Modified link: {modified_url}")
-    except Exception as e:
-        logger.error(f"Error processing link: {e}")
-        context.bot.send_message(chat_id=chat_id, text=f"Failed to process link: {e}")
-
-def handle_message(update: Update, context: CallbackContext):
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat.id
     link = update.message.text.strip()
-    chat_id = update.message.chat_id
-    user_links[chat_id] = link
-    update.message.reply_text(f"Processing your link every {REFRESH_INTERVAL} seconds...")
+    await update.message.reply_text(f"Received link. Starting download for: {link}")
 
-    # Start a background thread to send modified links every 30 seconds
-    def repeat_send():
-        while chat_id in user_links:
-            process_link(chat_id, link, context)
-            time.sleep(REFRESH_INTERVAL)
+    # --- Create a unique folder for this request ---
+    unique_id = uuid.uuid4().hex[:8]
+    user_folder = BASE_DOWNLOAD_DIR / f"user_{chat_id}_{unique_id}"
+    user_folder.mkdir(parents=True, exist_ok=True)
 
-    thread = threading.Thread(target=repeat_send, daemon=True)
-    thread.start()
+    # --- Run Gamdl CLI ---
+    cmd = [
+        "gamdl",
+        "--codec-song", "aac",       # Change codec if needed
+        "--output-path", str(user_folder),
+        link
+    ]
 
-def stop_links(update: Update, context: CallbackContext):
-    chat_id = update.message.chat_id
-    if chat_id in user_links:
-        del user_links[chat_id]
-        update.message.reply_text("Stopped sending links.")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError:
+        await update.message.reply_text("❌ Download failed. Check the link or your setup.")
+        shutil.rmtree(user_folder, ignore_errors=True)
+        return
+
+    # --- Send downloaded files to the user ---
+    files_sent = 0
+    for file_path in user_folder.rglob("*"):
+        if file_path.suffix.lower() in EXTENSIONS:
+            try:
+                with open(file_path, "rb") as f:
+                    await context.bot.send_document(chat_id=chat_id, document=f, filename=file_path.name)
+                files_sent += 1
+            except Exception as e:
+                await update.message.reply_text(f"Failed to send {file_path.name}: {e}")
+
+    # --- Delete the user folder to save space ---
+    shutil.rmtree(user_folder, ignore_errors=True)
+
+    if files_sent:
+        await update.message.reply_text(f"✅ Sent {files_sent} files.")
     else:
-        update.message.reply_text("No active link sending found.")
+        await update.message.reply_text("No files found to send.")
 
-def main():
-    TOKEN = "8479816021:AAGuvc_auuT4iYFn2vle0xVk-t2bswey8k8"
-    updater = Updater(TOKEN)
-
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("setdomain", set_domain))
-    dp.add_handler(CommandHandler("stop", stop_links))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-
-    updater.start_polling()
-    updater.idle()
-
+# ================= MAIN =================
 if __name__ == "__main__":
-    main()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_link))
+
+    print("Bot running... Users can send Apple Music links.")
+    app.run_polling()
