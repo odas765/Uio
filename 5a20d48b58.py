@@ -1,199 +1,134 @@
-import json
-import base64
 import os
+import json
+import logging
+from moviepy.editor import ImageClip, AudioFileClip
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+)
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
 
-from pathvalidate import sanitize_filepath
+# ───────────────────────────────
+# CONFIG
+# ───────────────────────────────
+TELEGRAM_BOT_TOKEN = "8479816021:AAGuvc_auuT4iYFn2vle0xVk-t2bswey8k8"
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
-from .tidal_api import tidalapi
-from .utils import *
-from .metadata import *
+# Enable logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-from ..utils import *
-from ..metadata import set_metadata
-from ..uploder import *
-from ..message import send_message
-
-from ...settings import bot_set
-import bot.helpers.translations as lang
-
-from bot.logger import LOGGER
-from config import Config
-
-
-async def start_tidal(url:str, user:dict):
-    item_id, type_ = await parse_url(url)
-
-    if type_ == 'track':
-        await start_track(item_id, user, None)
-    elif type_ == 'artist':
-        await start_artist(item_id, user)
-    elif type_ == 'album':
-        await start_album(item_id, user)
-    elif type_ == 'playlist':
-        pass
+# ───────────────────────────────
+# YOUTUBE AUTH
+# ───────────────────────────────
+def get_youtube_service():
+    creds = None
+    if os.path.exists("token.json"):
+        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
     else:
-        await send_message(user, "Invalid Tidal URL")
-        
+        flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
+        creds = flow.run_console()  # manual link-copy method for VPS
+        with open("token.json", "w") as token:
+            token.write(creds.to_json())
 
-async def start_track(track_id:int, user:dict, track_meta:dict | None, \
-    upload=True, basefolder=None, session=None, quality=None, disable_link=False, disable_msg=False):
-    
-    if not track_meta:
-        try:
-            track_data = await tidalapi.get_track(track_id)
-        except Exception as e:
-            return await send_message(user, e)
+    return build("youtube", "v3", credentials=creds)
 
-        track_meta = await get_track_metadata(track_id, track_data, user['r_id'])
-        filepath = f"{Config.DOWNLOAD_BASE_DIR}/{user['r_id']}/{track_meta['provider']}/{track_meta['albumartist']}/{track_meta['album']}"
-        session, quality = await get_stream_session(track_data)
-    else:
-        filepath = basefolder
+# ───────────────────────────────
+# VIDEO CREATION
+# ───────────────────────────────
+def create_video(image_path, audio_path, output_path):
+    audio = AudioFileClip(audio_path)
+    img = ImageClip(image_path).set_duration(audio.duration)
+    img = img.resize(height=720)
+    video = img.set_audio(audio)
+    video.write_videofile(output_path, fps=24, codec="libx264", audio_codec="aac")
+
+# ───────────────────────────────
+# TELEGRAM BOT HANDLERS
+# ───────────────────────────────
+user_sessions = {}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎬 Send me an image first.")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    photo = await update.message.photo[-1].get_file()
+    image_path = f"{user_id}_image.jpg"
+    await photo.download_to_drive(image_path)
+    user_sessions[user_id] = {"image": image_path}
+    await update.message.reply_text("✅ Image saved! Now send an audio file (MP3/WAV).")
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id not in user_sessions or "image" not in user_sessions[user_id]:
+        await update.message.reply_text("Please send an image first.")
+        return
+
+    audio = await update.message.audio.get_file()
+    audio_path = f"{user_id}_audio.mp3"
+    await audio.download_to_drive(audio_path)
+
+    user_sessions[user_id]["audio"] = audio_path
+    await update.message.reply_text("✅ Audio received! Now send title, description, and tags (comma-separated) in one message.")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id not in user_sessions or "audio" not in user_sessions[user_id]:
+        await update.message.reply_text("Please send image and audio first.")
+        return
 
     try:
-        stream_data = await tidalapi.get_stream_url(track_id, quality, session)
+        # Parse text input
+        text_parts = update.message.text.split("\n", 2)
+        title = text_parts[0].strip()
+        description = text_parts[1].strip() if len(text_parts) > 1 else ""
+        tags = text_parts[2].split(",") if len(text_parts) > 2 else []
+
+        session = user_sessions[user_id]
+        video_path = f"{user_id}_final.mp4"
+
+        await update.message.reply_text("🎥 Creating video, please wait...")
+        create_video(session["image"], session["audio"], video_path)
+
+        await update.message.reply_text("⬆️ Uploading to YouTube...")
+        youtube = get_youtube_service()
+
+        body = {
+            "snippet": {"title": title, "description": description, "tags": tags},
+            "status": {"privacyStatus": "public"}
+        }
+
+        media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/*")
+        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+        response = request.execute()
+
+        video_url = f"https://www.youtube.com/watch?v={response['id']}"
+        await update.message.reply_text(f"✅ Uploaded successfully!\n{video_url}")
+
+        # cleanup
+        for f in [session["image"], session["audio"], video_path]:
+            if os.path.exists(f): os.remove(f)
+        del user_sessions[user_id]
+
     except Exception as e:
-        error = e
-        if 'Asset is not ready for playback' in str(e):
-            error = f'Track [{track_id}] is not available in your region'
-        LOGGER.error(error)
-        return await send_message(user, error)
-    
-    if stream_data is not None:
+        logger.exception(e)
+        await update.message.reply_text(f"❌ Error: {e}")
 
-        track_meta['quality'] = await get_quality(stream_data)
+# ───────────────────────────────
+# MAIN
+# ───────────────────────────────
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    print("🤖 Bot is running... Press Ctrl+C to stop.")
+    app.run_polling()
 
-        if stream_data['manifestMimeType'] == 'application/dash+xml':
-            manifest = base64.b64decode(stream_data['manifest'])
-            urls, track_codec = parse_mpd(manifest)
-        else:
-            manifest = json.loads(base64.b64decode(stream_data['manifest']))
-            track_codec = 'AAC' if 'mp4a' in manifest['codecs'] else manifest['codecs'].upper()
-            urls = manifest['urls'][0]
-
-        track_meta['folderpath'] = filepath
-        filename = await format_string(Config.TRACK_NAME_FORMAT, track_meta, user)
-        filepath += f"/{filename}"
-        filepath = sanitize_filepath(filepath)
-        track_meta['filepath'] = filepath
-
-        # Download track(s)
-        if isinstance(urls, list):
-            i = 0
-            temp_files = []
-            for url in urls[0]:
-                temp_path = f"{filepath}.{i}"
-                err = await download_file(url, temp_path)
-                if err:
-                    return await send_message(user, err)
-                i += 1
-                temp_files.append(temp_path)
-            await merge_tracks(temp_files, filepath)
-        else:
-            err = await download_file(urls, filepath)
-            if err:
-                return await send_message(user, err)
-
-        # Convert to 320 kbps MP3 for Telegram
-        mp3_path = track_meta['filepath'] + ".mp3"
-        cmd = f'ffmpeg -i "{track_meta["filepath"]}" -codec:a libmp3lame -b:a 320k -y "{mp3_path}"'
-        os.system(cmd)
-        os.remove(track_meta['filepath'])
-
-        track_meta['filepath'] = mp3_path
-        track_meta['extension'] = 'mp3'
-
-        await set_metadata(track_meta)
-
-        if upload:
-            await track_upload(track_meta, user, False)
-
-    return True
-        
-
-async def start_album(album_id:int, user:dict, upload=True, basefolder=None):
-    try:
-        album_data = await tidalapi.get_album(album_id)
-    except Exception as e:
-        return await send_message(user, e)
-        
-    tracks_data = await tidalapi.get_album_tracks(album_id)
-    
-    album_meta = await get_album_metadata(album_id, album_data, tracks_data, user['r_id'])
-
-    if basefolder:
-        album_folder = basefolder + f"/{album_meta['title']}"
-    else:
-        album_folder = f"{Config.DOWNLOAD_BASE_DIR}/{user['r_id']}/{album_meta['provider']}/{album_meta['artist']}/{album_meta['title']}"
-    
-    album_folder = sanitize_filepath(album_folder)
-    album_meta['folderpath'] = album_folder
-
-    # get a track to get quality
-    track_id = tracks_data['items'][0]['id']
-    track_data = await tidalapi.get_track(track_id)
-    session, quality = await get_stream_session(track_data)
-    stream_data = await tidalapi.get_stream_url(track_id, quality, session)
-
-    album_meta['quality'] = await get_quality(stream_data)
-
-    if upload:
-        album_meta['poster_msg'] = await post_art_poster(user, album_meta)
-
-    # concurrent
-    tasks = []
-    for track in album_meta['tracks']:
-        tasks.append(start_track(track['itemid'], user, track, False, album_folder, session, quality))
-
-    update_details = {
-        'text': lang.s.DOWNLOAD_PROGRESS,
-        'msg': user['bot_msg'],
-        'title': album_meta['title'],
-        'type': album_meta['type']
-    }
-    await run_concurrent_tasks(tasks, update_details)
-
-    if bot_set.album_zip:
-        await edit_message(user['bot_msg'], lang.s.ZIPPING)
-        album_meta['folderpath'] = await zip_handler(album_meta['folderpath'])
-
-    # Upload
-    if upload:
-        await edit_message(user['bot_msg'], lang.s.UPLOADING)
-        await album_upload(album_meta, user)
-
-
-async def start_artist(artist_id:int, user:dict):
-    artist_data = await tidalapi.get_artist(artist_id)
-    artist_meta = await get_artist_metadata(artist_data, user['r_id'])
-    artist_meta['folderpath'] = f"{Config.DOWNLOAD_BASE_DIR}/{user['r_id']}/{artist_meta['provider']}/{artist_meta['artist']}"
-    artist_meta['folderpath'] = sanitize_filepath(artist_meta['folderpath'])
-    
-    try:
-        artist_albums = await tidalapi.get_artist_albums(artist_id)
-        artist_eps = await tidalapi.get_artist_albums_ep_singles(artist_id)
-    except Exception as e:
-        return await send_message(user, e)
-
-    albums = await sort_album_from_artist(artist_albums['items'])
-    ep_singles = await sort_album_from_artist(artist_eps['items'])
-    
-    albums.extend(ep_singles)
-
-    upload_album = True
-    if bot_set.artist_batch:
-        # for telegram, batch upload is not needed
-        upload_album = True if bot_set.upload_mode == 'Telegram' else False
-    if bot_set.artist_zip:
-        upload_album = False # final decision
-
-    for album in albums:
-        await start_album(album['id'], user, upload_album, artist_meta['folderpath'])
-
-    if not upload_album:
-        if bot_set.artist_zip:
-            await edit_message(user['bot_msg'], lang.s.ZIPPING)
-            artist_meta['folderpath'] = await zip_handler(artist_meta['folderpath'])
-        
-        await edit_message(user['bot_msg'], lang.s.UPLOADING)
-        await artist_upload(artist_meta, user)
+if __name__ == "__main__":
+    main()
