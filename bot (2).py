@@ -73,6 +73,25 @@ async def download_handler(event):
             await event.reply("⚠️ Download folder not found. Maybe the CLI didn’t create it.")
             return
 
+        # --- Find cover image if exists ---
+        cover_path = None
+        for f in os.listdir(release_path):
+            if f.lower().startswith(("cover", "folder")) and f.lower().endswith((".jpg", ".png", ".jpeg")):
+                cover_path = os.path.join(release_path, f)
+                break
+
+        # --- Album caption card ---
+        caption = f"🎵 *Beatport/Beatsource Release*\n\n🔗 [Open in Browser]({input_text})"
+        if cover_path:
+            await bot.send_file(
+                event.chat_id,
+                file=cover_path,
+                caption=caption,
+                parse_mode="markdown"
+            )
+        else:
+            await event.reply(caption, parse_mode="markdown")
+
         sent_files = 0
 
         # --- Recursively send audio files ---
