@@ -1,148 +1,194 @@
 import os
+import re
+import shutil
 import asyncio
-import pickle
-from moviepy.editor import ImageClip, AudioFileClip
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+import logging
+import subprocess
+import mutagen
+from telethon import TelegramClient, events, Button
+from telethon.tl.types import DocumentAttributeAudio
 
-# =====================
-# CONFIGURATION
-# =====================
-BOT_TOKEN = "8479816021:AAGuvc_auuT4iYFn2vle0xVk-t2bswey8k8"   # Replace this
-ALLOWED_USER_ID = 616584208             # Replace with your Telegram numeric user ID
-OAUTH_FILE = "client_secret.json"       # Your YouTube OAuth JSON file
-TOKEN_PICKLE = "token.pickle"
+# --- CONFIG ---
+API_ID = 8349121
+API_HASH = "9709d9b8c6c1aa3dd50107f97bb9aba6"
+BOT_TOKEN = "8479816021:AAGuvc_auuT4iYFn2vle0xVk-t2bswey8k8"
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-user_sessions = {}
+BEATPORTDL_DIR = "/home/mostlyfx7/beatportdl"
+DOWNLOADS_DIR = os.path.join(BEATPORTDL_DIR, "downloads")
 
-# =====================
-# YOUTUBE AUTH (CONSOLE-BASED)
-# =====================
-def get_youtube_service():
-    creds = None
-    if os.path.exists(TOKEN_PICKLE):
-        with open(TOKEN_PICKLE, "rb") as token:
-            creds = pickle.load(token)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(OAUTH_FILE, SCOPES)
-            auth_url, _ = flow.authorization_url(prompt='consent')
-            print("\n🔗 Open this URL in your browser to authorize the app:\n")
-            print(auth_url)
-            code = input("\n📋 Paste the authorization code here: ")
-            flow.fetch_token(code=code)
-            creds = flow.credentials
-        with open(TOKEN_PICKLE, "wb") as token:
-            pickle.dump(creds, token)
-    return build("youtube", "v3", credentials=creds)
+# --- LOGGING ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# =====================
-# TELEGRAM HANDLERS
-# =====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
-        return await update.message.reply_text("🚫 You are not allowed to use this bot.")
-    await update.message.reply_text("👋 Send me an *audio file* first.", parse_mode="Markdown")
+# --- TELETHON CLIENT ---
+bot = TelegramClient("beatsource_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
-        return
-    audio_file = await update.message.audio.get_file()
-    audio_path = f"audio_{update.effective_user.id}.mp3"
-    await audio_file.download_to_drive(audio_path)
-    user_sessions[update.effective_user.id] = {"audio": audio_path}
-    await update.message.reply_text("🎵 Audio received! Now send me an *image*.", parse_mode="Markdown")
+# --- URL PATTERN ---
+pattern = r"^https:\/\/www\.(beatport|beatsource)\.com\/(track|release)\/[\w\-\+]+\/(\d+)$"
 
-async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
-        return
-    photo = update.message.photo[-1]
-    img_file = await photo.get_file()
-    img_path = f"image_{update.effective_user.id}.jpg"
-    await img_file.download_to_drive(img_path)
-    session = user_sessions.get(update.effective_user.id, {})
-    session["image"] = img_path
-    user_sessions[update.effective_user.id] = session
-    await update.message.reply_text("🖼️ Image received! Now send me the *YouTube title*.", parse_mode="Markdown")
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID:
+# --- START / HELP ---
+@bot.on(events.NewMessage(pattern=r'^/(start|help)$'))
+async def start_handler(event):
+    text = (
+        "🤖 *Hey there!* I'm your Beatport + Beatsource Downloader Bot ⚡\n"
+        "Developed by @piklujazz\n\n"
+        "🗣️ Commands:\n"
+        "`/download <beatport-or-beatsource-link>` – Download any Beatport or Beatsource track or release 💫"
+    )
+    await event.reply(text, parse_mode="markdown")
+
+
+# --- DOWNLOAD COMMAND ---
+@bot.on(events.NewMessage(pattern=r'^/download\s+(.+)$'))
+async def download_handler(event):
+    url = event.pattern_match.group(1).strip()
+
+    match = re.match(pattern, url)
+    if not match:
+        await event.reply("❌ Invalid link.\nPlease send a valid Beatport or Beatsource *track* or *release* link.", parse_mode="markdown")
         return
 
-    uid = update.effective_user.id
-    text = update.message.text.strip()
-    session = user_sessions.get(uid, {})
+    await event.reply(
+        "🎧 Please choose your preferred format:",
+        buttons=[
+            [Button.inline("🎵 MP3", data=f"mp3|{url}")],
+            [Button.inline("💽 FLAC", data=f"flac|{url}")],
+            [Button.inline("🎶 WAV", data=f"wav|{url}")]
+        ]
+    )
 
-    if "title" not in session:
-        session["title"] = text
-        user_sessions[uid] = session
-        await update.message.reply_text("✏️ Got the title! Now send the *description*.")
+
+# --- CONVERSION FUNCTION ---
+async def convert_audio(input_file, output_file, fmt):
+    """
+    Converts audio using ffmpeg to desired format (mp3, flac, wav)
+    """
+    if fmt == "flac":
+        # No need to convert, just copy
+        shutil.copy2(input_file, output_file)
+        return True
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_file, 
+        "-vn", "-ar", "44100", "-ac", "2",
+        "-b:a", "320k" if fmt == "mp3" else "1411k",
+        output_file
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    await process.communicate()
+    return process.returncode == 0
+
+
+# --- CALLBACK HANDLER ---
+@bot.on(events.CallbackQuery)
+async def callback_handler(event):
+    try:
+        data = event.data.decode()
+        fmt, url = data.split("|", 1)
+    except Exception:
+        await event.answer("⚠️ Invalid selection.")
         return
 
-    if "description" not in session:
-        session["description"] = text
-        user_sessions[uid] = session
-        await update.message.reply_text("📝 Great! Now send *tags* (comma-separated).")
+    match = re.match(pattern, url)
+    if not match:
+        await event.edit("❌ Invalid URL pattern.")
         return
 
-    if "tags" not in session:
-        session["tags"] = [t.strip() for t in text.split(",")]
-        user_sessions[uid] = session
+    site, content_type, content_id = match.groups()
+    release_path = os.path.join(DOWNLOADS_DIR, content_id)
 
-        await update.message.reply_text("🎬 Creating video, please wait...")
+    await event.edit(f"⚙️ Downloading original FLAC files... please wait ⏳")
 
-        video_path = f"video_{uid}.mp4"
-        create_video(session["image"], session["audio"], video_path)
-        youtube = get_youtube_service()
-
-        request = youtube.videos().insert(
-            part="snippet,status",
-            body={
-                "snippet": {
-                    "title": session["title"],
-                    "description": session["description"],
-                    "tags": session["tags"]
-                },
-                "status": {"privacyStatus": "public"},
-            },
-            media_body=MediaFileUpload(video_path, chunksize=-1, resumable=True),
+    try:
+        # --- Run BeatportDL CLI (downloads raw FLAC) ---
+        process = await asyncio.create_subprocess_exec(
+            "go", "run", "./cmd/beatportdl", url,
+            cwd=BEATPORTDL_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        response = request.execute()
-        video_id = response["id"]
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=900)
+        logger.info(stdout.decode())
+        logger.error(stderr.decode())
 
-        await update.message.reply_text(f"✅ Uploaded to YouTube!\n🔗 https://youtu.be/{video_id}")
+        if not os.path.exists(release_path):
+            await event.edit("⚠️ Download folder not found. Maybe the CLI didn’t create it.")
+            return
 
-        # cleanup
-        for f in [session["audio"], session["image"], video_path]:
-            if os.path.exists(f):
-                os.remove(f)
-        del user_sessions[uid]
+        await event.edit(f"🎧 Converting to *{fmt.upper()}* format...", parse_mode="markdown")
 
-def create_video(image_path, audio_path, output_path):
-    audio_clip = AudioFileClip(audio_path)
-    img_clip = ImageClip(image_path).set_duration(audio_clip.duration)
-    img_clip = img_clip.resize(height=720)
-    video = img_clip.set_audio(audio_clip)
-    video.write_videofile(output_path, fps=24, codec="libx264", audio_codec="aac")
+        sent_files = 0
+        converted_dir = os.path.join(release_path, f"converted_{fmt}")
+        os.makedirs(converted_dir, exist_ok=True)
 
-# =====================
-# MAIN
-# =====================
+        # --- Convert and send audio files ---
+        for root, dirs, files in os.walk(release_path):
+            for f in files:
+                if f.endswith(".flac"):
+                    input_file = os.path.join(root, f)
+                    output_file = os.path.join(converted_dir, os.path.splitext(f)[0] + f".{fmt}")
+
+                    success = await convert_audio(input_file, output_file, fmt)
+                    if not success:
+                        await event.respond(f"⚠️ Failed to convert {f}")
+                        continue
+
+                    try:
+                        audio = mutagen.File(output_file)
+                        duration = 0
+                        title = os.path.splitext(f)[0]
+                        artist = "Unknown Artist"
+
+                        if audio is not None:
+                            if hasattr(audio, "info") and getattr(audio.info, "length", None):
+                                duration = int(audio.info.length)
+                            if hasattr(audio, "tags") and audio.tags is not None:
+                                if "TIT2" in audio.tags:
+                                    title = str(audio.tags["TIT2"])
+                                if "TPE1" in audio.tags:
+                                    artist = str(audio.tags["TPE1"])
+
+                        await bot.send_file(
+                            event.chat_id,
+                            file=output_file,
+                            attributes=[
+                                DocumentAttributeAudio(
+                                    duration=duration,
+                                    title=title,
+                                    performer=artist
+                                )
+                            ]
+                        )
+                        sent_files += 1
+
+                    except Exception as e:
+                        await event.respond(f"⚠️ Couldn't send {f}: {e}")
+
+        # --- Cleanup ---
+        shutil.rmtree(release_path, ignore_errors=True)
+
+        if sent_files > 0:
+            await event.respond(f"✅ Sent {sent_files} *{fmt.upper()}* file(s) and cleaned up successfully.", parse_mode="markdown")
+        else:
+            await event.respond("⚠️ No converted audio files found to send.")
+
+    except asyncio.TimeoutError:
+        await event.respond("⏱️ CLI download took too long and was stopped.")
+        process.kill()
+    except Exception as e:
+        await event.respond(f"⚠️ Error: {e}")
+
+
+# --- MAIN ---
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    print("🤖 Bot is running... Press Ctrl+C to stop.")
-    app.run_polling()
+    print("🤖 Bot is online... waiting for commands.")
+    bot.run_until_disconnected()
+
 
 if __name__ == "__main__":
     main()
