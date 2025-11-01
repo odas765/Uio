@@ -5,6 +5,7 @@ import asyncio
 import logging
 import subprocess
 import mutagen
+import uuid
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeAudio
 
@@ -25,6 +26,9 @@ bot = TelegramClient("beatsource_bot", API_ID, API_HASH).start(bot_token=BOT_TOK
 
 # --- URL PATTERN ---
 pattern = r"^https:\/\/www\.(beatport|beatsource)\.com\/(track|release)\/[\w\-\+]+\/(\d+)$"
+
+# --- Temporary format storage (for callback) ---
+download_sessions = {}  # {token: {"url": ..., "user": ...}}
 
 
 # --- START / HELP ---
@@ -49,28 +53,28 @@ async def download_handler(event):
         await event.reply("❌ Invalid link.\nPlease send a valid Beatport or Beatsource *track* or *release* link.", parse_mode="markdown")
         return
 
+    # Create a short unique ID for callback
+    token = uuid.uuid4().hex[:8]
+    download_sessions[token] = {"url": url, "user": event.sender_id}
+
     await event.reply(
         "🎧 Please choose your preferred format:",
         buttons=[
-            [Button.inline("🎵 MP3", data=f"mp3|{url}")],
-            [Button.inline("💽 FLAC", data=f"flac|{url}")],
-            [Button.inline("🎶 WAV", data=f"wav|{url}")]
+            [Button.inline("🎵 MP3", data=f"mp3|{token}")],
+            [Button.inline("💽 FLAC", data=f"flac|{token}")],
+            [Button.inline("🎶 WAV", data=f"wav|{token}")]
         ]
     )
 
 
 # --- CONVERSION FUNCTION ---
 async def convert_audio(input_file, output_file, fmt):
-    """
-    Converts audio using ffmpeg to desired format (mp3, flac, wav)
-    """
     if fmt == "flac":
-        # No need to convert, just copy
         shutil.copy2(input_file, output_file)
         return True
 
     cmd = [
-        "ffmpeg", "-y", "-i", input_file, 
+        "ffmpeg", "-y", "-i", input_file,
         "-vn", "-ar", "44100", "-ac", "2",
         "-b:a", "320k" if fmt == "mp3" else "1411k",
         output_file
@@ -89,9 +93,22 @@ async def convert_audio(input_file, output_file, fmt):
 async def callback_handler(event):
     try:
         data = event.data.decode()
-        fmt, url = data.split("|", 1)
+        fmt, token = data.split("|", 1)
     except Exception:
         await event.answer("⚠️ Invalid selection.")
+        return
+
+    # Lookup the stored URL using token
+    if token not in download_sessions:
+        await event.edit("⚠️ Session expired or invalid.")
+        return
+
+    session = download_sessions[token]
+    url = session["url"]
+    user = session["user"]
+
+    if event.sender_id != user:
+        await event.answer("⚠️ You can only use your own buttons.")
         return
 
     match = re.match(pattern, url)
@@ -126,7 +143,6 @@ async def callback_handler(event):
         converted_dir = os.path.join(release_path, f"converted_{fmt}")
         os.makedirs(converted_dir, exist_ok=True)
 
-        # --- Convert and send audio files ---
         for root, dirs, files in os.walk(release_path):
             for f in files:
                 if f.endswith(".flac"):
@@ -169,13 +185,15 @@ async def callback_handler(event):
                     except Exception as e:
                         await event.respond(f"⚠️ Couldn't send {f}: {e}")
 
-        # --- Cleanup ---
         shutil.rmtree(release_path, ignore_errors=True)
 
         if sent_files > 0:
             await event.respond(f"✅ Sent {sent_files} *{fmt.upper()}* file(s) and cleaned up successfully.", parse_mode="markdown")
         else:
             await event.respond("⚠️ No converted audio files found to send.")
+
+        # Clean up session
+        del download_sessions[token]
 
     except asyncio.TimeoutError:
         await event.respond("⏱️ CLI download took too long and was stopped.")
