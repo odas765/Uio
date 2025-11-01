@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+import subprocess
 import asyncio
 import logging
 import mutagen
@@ -8,9 +9,9 @@ from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeAudio
 
 # --- CONFIG ---
-API_ID = 8349121
-API_HASH = "9709d9b8c6c1aa3dd50107f97bb9aba6"
-BOT_TOKEN = "8479816021:AAGuvc_auuT4iYFn2vle0xVk-t2bswey8k8"
+API_ID = 8349121  # 🔹 your Telegram API ID
+API_HASH = "9709d9b8c6c1aa3dd50107f97bb9aba6"  # 🔹 your Telegram API hash
+BOT_TOKEN = "8479816021:AAGuvc_auuT4iYFn2vle0xVk-t2bswey8k8"  # 🔹 your bot token
 
 BEATPORTDL_DIR = "/home/mostlyfx7/beatportdl"
 DOWNLOADS_DIR = os.path.join(BEATPORTDL_DIR, "downloads")
@@ -65,38 +66,16 @@ async def download_handler(event):
         logger.info(stdout.decode())
         logger.error(stderr.decode())
 
-        # --- Find latest downloaded folder ---
-        subfolders = [os.path.join(DOWNLOADS_DIR, d) for d in os.listdir(DOWNLOADS_DIR)]
-        if not subfolders:
-            await event.reply("⚠️ No folder found in downloads directory.")
+        release_id = input_text.rstrip("/").split("/")[-1]
+        release_path = os.path.join(DOWNLOADS_DIR, release_id)
+
+        if not os.path.exists(release_path):
+            await event.reply("⚠️ Download folder not found. Maybe the CLI didn’t create it.")
             return
 
-        release_path = max(subfolders, key=os.path.getmtime)
-
-        # --- Try finding cover art ---
-        cover_path = None
-        for f in os.listdir(release_path):
-            if f.lower().startswith(("cover", "folder")) and f.lower().endswith((".jpg", ".png", ".jpeg")):
-                cover_path = os.path.join(release_path, f)
-                break
-
-        # --- Create caption card ---
-        release_name = os.path.basename(release_path)
-        caption = f"🎵 **{release_name.replace('_', ' ')}**\n🔗 [Open in Beatport]({input_text})"
-
-        # --- Send album cover card ---
-        if cover_path:
-            await bot.send_file(
-                event.chat_id,
-                file=cover_path,
-                caption=caption,
-                parse_mode="markdown"
-            )
-        else:
-            await event.reply(caption, parse_mode="markdown")
-
-        # --- Recursively send .flac and .mp3 files ---
         sent_files = 0
+
+        # --- Recursively send audio files ---
         for root, dirs, files in os.walk(release_path):
             for f in files:
                 if f.endswith(('.flac', '.mp3')):
@@ -113,6 +92,7 @@ async def download_handler(event):
                             if hasattr(audio, "info") and getattr(audio.info, "length", None):
                                 duration = int(audio.info.length)
 
+                            # ID3 tags (MP3)
                             if hasattr(audio, "tags") and audio.tags is not None:
                                 if "TIT2" in audio.tags:
                                     title = str(audio.tags["TIT2"])
@@ -124,12 +104,13 @@ async def download_handler(event):
                                 elif "artist" in audio.tags:
                                     artist = str(audio.tags["artist"][0])
 
-                        # --- Fallback: derive from filename ---
+                        # --- Fallback: derive from filename if missing ---
                         if artist == "Unknown Artist":
                             parts = os.path.splitext(f)[0].replace("_", " ").split(" - ")
                             if len(parts) >= 2:
                                 artist, title = parts[0].strip(), parts[1].strip()
 
+                        # --- Send with proper audio attributes ---
                         await bot.send_file(
                             event.chat_id,
                             file=file_path,
@@ -150,7 +131,7 @@ async def download_handler(event):
         shutil.rmtree(release_path, ignore_errors=True)
 
         if sent_files > 0:
-            await event.reply(f"✅ Sent {sent_files} track(s) successfully and cleaned up.")
+            await event.reply(f"✅ Sent {sent_files} file(s) and cleaned up successfully.")
         else:
             await event.reply("⚠️ No audio files found to send.")
 
