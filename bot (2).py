@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+import subprocess
 import asyncio
 import logging
 import mutagen
@@ -33,7 +34,7 @@ async def start_handler(event):
         "🤖 *Hey there!* I'm your Beatport + Beatsource Downloader Bot ⚡\n"
         "Developed by @piklujazz\n\n"
         "🗣️ Commands:\n"
-        "`/download <beatport-or-beatsource-link>` – Download album + send cover card with FLACs 💫"
+        "`/download <beatport-or-beatsource-link>` – Download any Beatport or Beatsource track or album 💫"
     )
     await event.reply(text, parse_mode="markdown")
 
@@ -65,91 +66,24 @@ async def download_handler(event):
         logger.info(stdout.decode())
         logger.error(stderr.decode())
 
-        # --- Find latest downloaded folder ---
-        subfolders = [os.path.join(DOWNLOADS_DIR, d) for d in os.listdir(DOWNLOADS_DIR)]
-        if not subfolders:
-            await event.reply("⚠️ No downloads found.")
+        release_id = input_text.rstrip("/").split("/")[-1]
+        release_path = os.path.join(DOWNLOADS_DIR, release_id)
+
+        if not os.path.exists(release_path):
+            await event.reply("⚠️ Download folder not found. Maybe the CLI didn’t create it.")
             return
 
-        release_path = max(subfolders, key=os.path.getmtime)
-
-        # --- Find cover image ---
-        cover_path = None
-        for fname in ["cover.jpg", "folder.jpg", "front.jpg", "cover.png"]:
-            test_path = os.path.join(release_path, fname)
-            if os.path.exists(test_path):
-                cover_path = test_path
-                break
-
-        # --- Extract metadata ---
-        album_title = os.path.basename(release_path)
-        all_artists = set()
-        catalog_number = "Unknown"
-        tracklist = []
-
-        for root, dirs, files in os.walk(release_path):
-            for f in files:
-                if f.endswith(".flac"):
-                    file_path = os.path.join(root, f)
-                    audio = mutagen.File(file_path)
-                    title = os.path.splitext(f)[0]
-
-                    if audio is not None and hasattr(audio, "tags") and audio.tags is not None:
-                        if "TPE1" in audio.tags:
-                            all_artists.add(str(audio.tags["TPE1"]))
-                        elif "artist" in audio.tags:
-                            all_artists.add(str(audio.tags["artist"][0]))
-
-                        if "TALB" in audio.tags:
-                            album_title = str(audio.tags["TALB"])
-                        elif "album" in audio.tags:
-                            album_title = str(audio.tags["album"][0])
-
-                        if "TPUB" in audio.tags:
-                            catalog_number = str(audio.tags["TPUB"])
-                        elif "CATALOGNUMBER" in audio.tags:
-                            catalog_number = str(audio.tags["CATALOGNUMBER"][0])
-
-                        if "TIT2" in audio.tags:
-                            title = str(audio.tags["TIT2"])
-                        elif "title" in audio.tags:
-                            title = str(audio.tags["title"][0])
-
-                    tracklist.append(f"• {title}")
-
-        if not all_artists and " - " in album_title:
-            all_artists.add(album_title.split(" - ")[0])
-
-        artists_str = ", ".join(sorted(all_artists)) or "Unknown Artist"
-        tracklist_str = "\n".join(tracklist[:15]) if tracklist else "No tracklist found."
-
-        # --- Send album caption card ---
-        caption = (
-            f"🎵 *{album_title}*\n"
-            f"👨‍🎤 *Artists:* {artists_str}\n"
-            f"🆔 *Catalog:* `{catalog_number}`\n\n"
-            f"🎶 *Tracklist:*\n{tracklist_str}\n\n"
-            f"🌐 [View on Beatport]({input_text})"
-        )
-
-        if cover_path:
-            await bot.send_file(
-                event.chat_id,
-                file=cover_path,
-                caption=caption,
-                parse_mode="markdown"
-            )
-        else:
-            await event.reply(caption, parse_mode="markdown")
-
-        # --- Send only FLAC tracks ---
         sent_files = 0
+
+        # --- Recursively send audio files ---
         for root, dirs, files in os.walk(release_path):
             for f in files:
-                if f.endswith(".flac"):
+                if f.endswith(('.flac', '.mp3')):
                     file_path = os.path.join(root, f)
                     try:
                         audio = mutagen.File(file_path)
+
+                        # --- Extract metadata ---
                         duration = 0
                         title = os.path.splitext(f)[0]
                         artist = "Unknown Artist"
@@ -157,6 +91,8 @@ async def download_handler(event):
                         if audio is not None:
                             if hasattr(audio, "info") and getattr(audio.info, "length", None):
                                 duration = int(audio.info.length)
+
+                            # ID3 tags (MP3)
                             if hasattr(audio, "tags") and audio.tags is not None:
                                 if "TIT2" in audio.tags:
                                     title = str(audio.tags["TIT2"])
@@ -168,6 +104,13 @@ async def download_handler(event):
                                 elif "artist" in audio.tags:
                                     artist = str(audio.tags["artist"][0])
 
+                        # --- Fallback: derive from filename if missing ---
+                        if artist == "Unknown Artist":
+                            parts = os.path.splitext(f)[0].replace("_", " ").split(" - ")
+                            if len(parts) >= 2:
+                                artist, title = parts[0].strip(), parts[1].strip()
+
+                        # --- Send with proper audio attributes ---
                         await bot.send_file(
                             event.chat_id,
                             file=file_path,
@@ -180,15 +123,17 @@ async def download_handler(event):
                             ]
                         )
                         sent_files += 1
+
                     except Exception as e:
                         await event.reply(f"⚠️ Couldn't send {f}: {e}")
 
+        # --- Cleanup ---
         shutil.rmtree(release_path, ignore_errors=True)
 
         if sent_files > 0:
-            await event.reply(f"✅ Sent {sent_files} FLAC file(s) successfully.")
+            await event.reply(f"✅ Sent {sent_files} file(s) and cleaned up successfully.")
         else:
-            await event.reply("⚠️ No FLAC files found to send.")
+            await event.reply("⚠️ No audio files found to send.")
 
     except asyncio.TimeoutError:
         await event.reply("⏱️ CLI download took too long and was stopped.")
