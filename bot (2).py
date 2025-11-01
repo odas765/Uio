@@ -9,9 +9,9 @@ from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeAudio
 
 # --- CONFIG ---
-API_ID = 8349121  # 🔹 your Telegram API ID
-API_HASH = "9709d9b8c6c1aa3dd50107f97bb9aba6"  # 🔹 your Telegram API hash
-BOT_TOKEN = "8479816021:AAGuvc_auuT4iYFn2vle0xVk-t2bswey8k8"  # 🔹 your bot token
+API_ID = 8349121
+API_HASH = "9709d9b8c6c1aa3dd50107f97bb9aba6"
+BOT_TOKEN = "8479816021:AAGuvc_auuT4iYFn2vle0xVk-t2bswey8k8"
 
 BEATPORTDL_DIR = "/home/mostlyfx7/beatportdl"
 DOWNLOADS_DIR = os.path.join(BEATPORTDL_DIR, "downloads")
@@ -63,7 +63,8 @@ async def download_handler(event):
             stdin=asyncio.subprocess.DEVNULL
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=600)
-        logger.info(stdout.decode())
+        out_text = stdout.decode()
+        logger.info(out_text)
         logger.error(stderr.decode())
 
         release_id = input_text.rstrip("/").split("/")[-1]
@@ -73,24 +74,24 @@ async def download_handler(event):
             await event.reply("⚠️ Download folder not found. Maybe the CLI didn’t create it.")
             return
 
-        # --- Find cover image if exists ---
-        cover_path = None
-        for f in os.listdir(release_path):
-            if f.lower().startswith(("cover", "folder")) and f.lower().endswith((".jpg", ".png", ".jpeg")):
-                cover_path = os.path.join(release_path, f)
-                break
+        # --- Extract caption details from CLI output ---
+        title, artists, catalogue = "Unknown", "Unknown", "Unknown"
+        for line in out_text.splitlines():
+            if "Title:" in line:
+                title = line.split("Title:")[-1].strip()
+            elif "Artists:" in line:
+                artists = line.split("Artists:")[-1].strip()
+            elif "Catalogue:" in line or "Catalog:" in line:
+                catalogue = line.split(":")[-1].strip()
 
-        # --- Album caption card ---
-        caption = f"🎵 *Beatport/Beatsource Release*\n\n🔗 [Open in Browser]({input_text})"
-        if cover_path:
-            await bot.send_file(
-                event.chat_id,
-                file=cover_path,
-                caption=caption,
-                parse_mode="markdown"
-            )
-        else:
-            await event.reply(caption, parse_mode="markdown")
+        caption = (
+            f"🎨 *Artists:* {artists}\n"
+            f"💽 *Title:* {title}\n"
+            f"🧾 *Catalogue:* {catalogue}"
+        )
+
+        # --- Send caption card ---
+        await bot.send_message(event.chat_id, caption, parse_mode="markdown")
 
         sent_files = 0
 
@@ -101,43 +102,37 @@ async def download_handler(event):
                     file_path = os.path.join(root, f)
                     try:
                         audio = mutagen.File(file_path)
-
-                        # --- Extract metadata ---
                         duration = 0
-                        title = os.path.splitext(f)[0]
-                        artist = "Unknown Artist"
+                        title_tag = os.path.splitext(f)[0]
+                        artist_tag = "Unknown Artist"
 
                         if audio is not None:
                             if hasattr(audio, "info") and getattr(audio.info, "length", None):
                                 duration = int(audio.info.length)
 
-                            # ID3 tags (MP3)
                             if hasattr(audio, "tags") and audio.tags is not None:
                                 if "TIT2" in audio.tags:
-                                    title = str(audio.tags["TIT2"])
+                                    title_tag = str(audio.tags["TIT2"])
                                 elif "title" in audio.tags:
-                                    title = str(audio.tags["title"][0])
-
+                                    title_tag = str(audio.tags["title"][0])
                                 if "TPE1" in audio.tags:
-                                    artist = str(audio.tags["TPE1"])
+                                    artist_tag = str(audio.tags["TPE1"])
                                 elif "artist" in audio.tags:
-                                    artist = str(audio.tags["artist"][0])
+                                    artist_tag = str(audio.tags["artist"][0])
 
-                        # --- Fallback: derive from filename if missing ---
-                        if artist == "Unknown Artist":
+                        if artist_tag == "Unknown Artist":
                             parts = os.path.splitext(f)[0].replace("_", " ").split(" - ")
                             if len(parts) >= 2:
-                                artist, title = parts[0].strip(), parts[1].strip()
+                                artist_tag, title_tag = parts[0].strip(), parts[1].strip()
 
-                        # --- Send with proper audio attributes ---
                         await bot.send_file(
                             event.chat_id,
                             file=file_path,
                             attributes=[
                                 DocumentAttributeAudio(
                                     duration=duration,
-                                    title=title,
-                                    performer=artist
+                                    title=title_tag,
+                                    performer=artist_tag
                                 )
                             ]
                         )
@@ -146,7 +141,6 @@ async def download_handler(event):
                     except Exception as e:
                         await event.reply(f"⚠️ Couldn't send {f}: {e}")
 
-        # --- Cleanup ---
         shutil.rmtree(release_path, ignore_errors=True)
 
         if sent_files > 0:
@@ -161,7 +155,6 @@ async def download_handler(event):
         await event.reply(f"⚠️ Error: {e}")
 
 
-# --- MAIN ---
 def main():
     print("🤖 Bot is online... waiting for commands.")
     bot.run_until_disconnected()
