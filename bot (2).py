@@ -1,7 +1,6 @@
 import os
 import re
 import shutil
-import subprocess
 import asyncio
 import logging
 import mutagen
@@ -23,7 +22,7 @@ logger = logging.getLogger(__name__)
 # --- TELETHON CLIENT ---
 bot = TelegramClient("beatport_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# --- REGEX PATTERN ---
+# --- REGEX PATTERN FOR LINK ---
 pattern = r"^https:\/\/www\.(beatport|beatsource)\.com\/(track|release)\/[\w\-\+]+\/\d+$"
 
 
@@ -31,27 +30,29 @@ pattern = r"^https:\/\/www\.(beatport|beatsource)\.com\/(track|release)\/[\w\-\+
 @bot.on(events.NewMessage(pattern=r'^/(start|help)$'))
 async def start_handler(event):
     text = (
-        "🤖 *Hey there!* I'm your Beatport + Beatsource Downloader Bot ⚡\n"
+        "🎶 *Hey there!* I'm your Beatport + Beatsource Downloader Bot ⚡\n"
         "Developed by @piklujazz\n\n"
-        "🗣️ Commands:\n"
-        "`/download <beatport-or-beatsource-link>` – Download any Beatport or Beatsource track or album 💫"
+        "📥 *Usage:*\n"
+        "Just send me any *Beatport* or *Beatsource* track or release link,\n"
+        "and I’ll fetch it for you automatically 💫"
     )
     await event.reply(text, parse_mode="markdown")
 
 
-# --- DOWNLOAD COMMAND ---
-@bot.on(events.NewMessage(pattern=r'^/download\s+(.+)$'))
-async def download_handler(event):
-    input_text = event.pattern_match.group(1).strip()
+# --- AUTOMATIC LINK DETECTION ---
+@bot.on(events.NewMessage)
+async def auto_download_handler(event):
+    input_text = event.raw_text.strip()
 
     if not re.match(pattern, input_text):
-        await event.reply(
-            "❌ Invalid link.\nPlease send a valid *Beatport* or *Beatsource* track or release link.",
-            parse_mode="markdown"
-        )
-        return
+        return  # Ignore messages that are not Beatport/Beatsource links
 
-    await event.reply("⚙️ Downloading... please wait ⏳")
+    # More beautiful “Downloading” message
+    msg = await event.reply(
+        "🎧 *Fetching your music...*\n"
+        "🔄 This may take a few minutes, please wait patiently ⏳",
+        parse_mode="markdown"
+    )
 
     try:
         # --- Run BeatportDL CLI ---
@@ -70,45 +71,8 @@ async def download_handler(event):
         release_path = os.path.join(DOWNLOADS_DIR, release_id)
 
         if not os.path.exists(release_path):
-            await event.reply("⚠️ Download folder not found. Maybe the CLI didn’t create it.")
+            await msg.edit("⚠️ *Download failed.* Folder not found after download.", parse_mode="markdown")
             return
-
-        # --- Extract caption info from first audio file ---
-        artists = "Unknown"
-        title = "Unknown"
-        catalogue = "Unknown"
-
-        first_audio = None
-        for root, _, files in os.walk(release_path):
-            for f in files:
-                if f.endswith(('.flac', '.mp3')):
-                    first_audio = os.path.join(root, f)
-                    break
-            if first_audio:
-                break
-
-        if first_audio:
-            try:
-                audio = mutagen.File(first_audio, easy=True)
-                if audio:
-                    title = audio.get("album", ["Unknown"])[0]
-                    artists = ", ".join(audio.get("artist", ["Unknown"]))
-                    catalogue = audio.get("catalogue_number", ["Unknown"])[0]
-            except Exception as e:
-                logger.warning(f"Metadata read error: {e}")
-
-        caption = (
-            f"🎨 *Artists:* {artists}\n"
-            f"💽 *Title:* {title}\n"
-            f"🧾 *Catalogue:* {catalogue}"
-        )
-
-        # --- Send cover image with caption if exists ---
-        cover_path = os.path.join(release_path, "cover.jpg")
-        if os.path.exists(cover_path):
-            await bot.send_file(event.chat_id, file=cover_path, caption=caption, parse_mode="markdown")
-        else:
-            await bot.send_message(event.chat_id, caption, parse_mode="markdown")
 
         # --- Send all audio files ---
         sent_files = 0
@@ -160,19 +124,19 @@ async def download_handler(event):
         shutil.rmtree(release_path, ignore_errors=True)
 
         if sent_files > 0:
-            await event.reply(f"✅ Sent {sent_files} file(s) and cleaned up successfully.")
+            await msg.edit(f"✅ *Sent {sent_files} file(s) successfully.*", parse_mode="markdown")
         else:
-            await event.reply("⚠️ No audio files found to send.")
+            await msg.edit("⚠️ *No audio files found to send.*", parse_mode="markdown")
 
     except asyncio.TimeoutError:
-        await event.reply("⏱️ CLI download took too long and was stopped.")
+        await msg.edit("⏱️ *Download took too long and was stopped.*", parse_mode="markdown")
         process.kill()
     except Exception as e:
-        await event.reply(f"⚠️ Error: {e}")
+        await msg.edit(f"⚠️ *Error:* {e}", parse_mode="markdown")
 
 
 def main():
-    print("🤖 Bot is online... waiting for commands.")
+    print("🤖 Bot is online... waiting for links.")
     bot.run_until_disconnected()
 
 
