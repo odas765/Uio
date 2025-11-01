@@ -63,8 +63,7 @@ async def download_handler(event):
             stdin=asyncio.subprocess.DEVNULL
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=600)
-        out_text = stdout.decode()
-        logger.info(out_text)
+        logger.info(stdout.decode())
         logger.error(stderr.decode())
 
         release_id = input_text.rstrip("/").split("/")[-1]
@@ -74,15 +73,29 @@ async def download_handler(event):
             await event.reply("⚠️ Download folder not found. Maybe the CLI didn’t create it.")
             return
 
-        # --- Extract caption details from CLI output ---
-        title, artists, catalogue = "Unknown", "Unknown", "Unknown"
-        for line in out_text.splitlines():
-            if "Title:" in line:
-                title = line.split("Title:")[-1].strip()
-            elif "Artists:" in line:
-                artists = line.split("Artists:")[-1].strip()
-            elif "Catalogue:" in line or "Catalog:" in line:
-                catalogue = line.split(":")[-1].strip()
+        # --- Extract caption info from first audio file ---
+        artists = "Unknown"
+        title = "Unknown"
+        catalogue = "Unknown"
+
+        first_audio = None
+        for root, _, files in os.walk(release_path):
+            for f in files:
+                if f.endswith(('.flac', '.mp3')):
+                    first_audio = os.path.join(root, f)
+                    break
+            if first_audio:
+                break
+
+        if first_audio:
+            try:
+                audio = mutagen.File(first_audio, easy=True)
+                if audio:
+                    title = audio.get("album", ["Unknown"])[0]
+                    artists = ", ".join(audio.get("artist", ["Unknown"]))
+                    catalogue = audio.get("catalogue_number", ["Unknown"])[0]
+            except Exception as e:
+                logger.warning(f"Metadata read error: {e}")
 
         caption = (
             f"🎨 *Artists:* {artists}\n"
@@ -90,12 +103,15 @@ async def download_handler(event):
             f"🧾 *Catalogue:* {catalogue}"
         )
 
-        # --- Send caption card ---
-        await bot.send_message(event.chat_id, caption, parse_mode="markdown")
+        # --- Send cover image with caption if exists ---
+        cover_path = os.path.join(release_path, "cover.jpg")
+        if os.path.exists(cover_path):
+            await bot.send_file(event.chat_id, file=cover_path, caption=caption, parse_mode="markdown")
+        else:
+            await bot.send_message(event.chat_id, caption, parse_mode="markdown")
 
+        # --- Send all audio files ---
         sent_files = 0
-
-        # --- Recursively send audio files ---
         for root, dirs, files in os.walk(release_path):
             for f in files:
                 if f.endswith(('.flac', '.mp3')):
